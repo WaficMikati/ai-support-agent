@@ -8,9 +8,9 @@ bare KeyError.
 import pytest
 
 from agent import (
-    Classification,
     Conversation,
     Message,
+    Proposal,
     env_value,
     load_env_file,
     require_env,
@@ -72,8 +72,9 @@ def run_passes(knowledge_file, passes: int, inbox) -> None:
             sleep=sleep,
             inbox=inbox,
             payments=None,
-            classify=lambda message: Classification("support", 0.99),
-            answer=lambda message, knowledge, articles=(): knowledge.strip(),
+            understand=lambda turns, knowledge, articles=(): Proposal(
+                reply=knowledge.strip(), refund_requested=False, confidence=0.99
+            ),
             interval_seconds=0,
         )
 
@@ -101,8 +102,9 @@ def test_editing_the_knowledge_file_takes_effect_without_a_restart(tmp_path):
             sleep=sleep,
             inbox=inbox,
             payments=None,
-            classify=lambda message: Classification("support", 0.99),
-            answer=lambda message, knowledge_text, articles=(): knowledge_text.strip(),
+            understand=lambda turns, knowledge_text, articles=(): Proposal(
+                reply=knowledge_text.strip(), refund_requested=False, confidence=0.99
+            ),
             interval_seconds=0,
         )
 

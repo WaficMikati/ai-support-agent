@@ -9,10 +9,10 @@ from datetime import datetime, timezone
 
 from agent import (
     Charge,
-    Classification,
     Conversation,
     HandledMessages,
     Message,
+    Proposal,
     handle_conversation,
     refund_idempotency_key,
     run_once,
@@ -62,11 +62,11 @@ class ExplodingBrain:
     def __init__(self):
         self.calls = 0
 
-    def __call__(self, message):
+    def __call__(self, turns, knowledge, articles=()):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("model API returned 503")
-        return Classification("support", 0.99)
+        return Proposal(reply="answer", refund_requested=False, confidence=0.99)
 
 
 def charge(**overrides) -> Charge:
@@ -97,8 +97,12 @@ def act(conv, handled, *, inbox=None, payments=None, intent="support", brain=Non
         conv,
         inbox=inbox,
         payments=payments,
-        classify=brain or (lambda message: Classification(intent, 0.99)),
-        answer=lambda message, knowledge, articles=(): "answer",
+        understand=brain
+        or (
+            lambda turns, knowledge, articles=(): Proposal(
+                reply="answer", refund_requested=intent == "refund", confidence=0.99
+            )
+        ),
         knowledge="guidance",
         handled=handled,
         now=NOW,
@@ -191,8 +195,9 @@ def test_the_loop_shares_one_set_across_passes():
     common = dict(
         inbox=inbox,
         payments=FakePayments(charge()),
-        classify=lambda message: Classification("support", 0.99),
-        answer=lambda message, knowledge, articles=(): "answer",
+        understand=lambda turns, knowledge, articles=(): Proposal(
+            reply="answer", refund_requested=False, confidence=0.99
+        ),
         knowledge="guidance",
         handled=handled,
     )

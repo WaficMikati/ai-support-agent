@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -97,10 +98,34 @@ class Message:
 
 
 @dataclass(frozen=True)
+class Turn:
+    """One thing somebody said, as the model sees it."""
+
+    role: str  # "user" | "assistant"
+    content: str
+
+
+@dataclass(frozen=True)
 class Conversation:
     id: int
     contact_email: str | None
     messages: tuple[Message, ...]
+
+    def turns(self, limit: int = 10) -> tuple[Turn, ...]:
+        """The conversation as the model should read it, oldest last-limit first.
+
+        Private notes are left out: they are written for colleagues, not for the
+        customer, and showing them to the model invites it to repeat internal
+        reasoning back to whoever is asking. Chatwoot's own activity and
+        template entries are left out because nobody said them.
+        """
+        spoken = [
+            Turn(role="user" if message.incoming else "assistant", content=message.content)
+            for message in self.messages
+            if not message.activity and not message.template and not message.private
+            and message.content.strip()
+        ]
+        return tuple(spoken[-limit:])
 
     @property
     def latest(self) -> Message | None:
@@ -143,9 +168,17 @@ class Charge:
 
 
 @dataclass(frozen=True)
-class Classification:
-    intent: str  # "refund" | "support"
-    confidence: float
+class Proposal:
+    """What the model thinks should happen next.
+
+    A proposal rather than a decision. The reply is used as written unless money
+    moves, and whether money moves is settled afterwards by `refund_decision`,
+    in code, against thresholds the model never sees.
+    """
+
+    reply: str
+    refund_requested: bool
+    confidence: float  # how sure it is about refund_requested
 
 
 @dataclass(frozen=True)
@@ -171,14 +204,13 @@ class Payments(Protocol):
     def refund(self, charge_id: str, idempotency_key: str) -> str: ...
 
 
-class Classifier(Protocol):
-    def __call__(self, message: str) -> Classification: ...
-
-
-class Answerer(Protocol):
+class Understander(Protocol):
     def __call__(
-        self, message: str, knowledge: str, articles: Sequence[Article]
-    ) -> str: ...
+        self,
+        turns: Sequence[Turn],
+        knowledge: str,
+        articles: Sequence[Article],
+    ) -> Proposal: ...
 
 
 class HelpCentre(Protocol):
@@ -289,6 +321,46 @@ def refund_idempotency_key(conversation_id: int, message_id: int) -> str:
     return f"refund-conv{conversation_id}-msg{message_id}"
 
 
+HOLDING_REPLY = (
+    "Thanks for getting in touch. I've passed this to a colleague who will look "
+    "at your refund and come back to you shortly."
+)
+
+# Phrases that would tell a customer their money is on the way. Deliberately
+# blunt: this only has to catch a model that ignored the instruction not to
+# promise an outcome, and a false positive costs nothing but a plainer reply.
+PROMISES_A_REFUND = (
+    "refunded",
+    "refund has been",
+    "on its way back",
+    "back to your",
+    "processed your refund",
+    "issued your refund",
+    "you will receive",
+    "you'll receive",
+)
+
+
+def safe_holding_reply(reply: str) -> str:
+    """The model's reply, unless it promised a refund nobody has approved."""
+    lowered = reply.lower()
+    if any(phrase in lowered for phrase in PROMISES_A_REFUND):
+        log.warning("proposal promised a refund before approval, using safe wording")
+        return HOLDING_REPLY
+    return reply
+
+
+def retrieval_query(turns: Sequence[Turn]) -> str:
+    """What to search the help centre for.
+
+    The last two things the customer said rather than only the newest, because
+    a follow-up is often too short to search on: "and the decaf one?" means
+    nothing by itself but is answerable next to the question before it.
+    """
+    said = [turn.content for turn in turns if turn.role == "user"]
+    return " ".join(said[-2:])
+
+
 def needs_reply(conversation: Conversation) -> bool:
     """True when the customer spoke last.
 
@@ -310,8 +382,7 @@ def handle_conversation(
     *,
     inbox: Inbox,
     payments: Payments,
-    classify: Classifier,
-    answer: Answerer,
+    understand: Understander,
     knowledge: str,
     help_centre: HelpCentre | None = None,
     handled: HandledMessages | None = None,
@@ -325,33 +396,35 @@ def handle_conversation(
     if handled is not None and latest.id in handled:
         return "already handled"
 
-    result = classify(latest.content)
+    turns = conversation.turns()
+    articles = help_centre.relevant(retrieval_query(turns)) if help_centre else []
+    if articles:
+        log.info(
+            "conversation %s retrieved %s",
+            conversation.id,
+            ", ".join(article.title for article in articles),
+        )
+
+    proposal = understand(turns, knowledge, articles)
     log.info(
-        "conversation %s classified as %s (%.2f)",
+        "conversation %s: refund_requested=%s (%.2f) over %s turns",
         conversation.id,
-        result.intent,
-        result.confidence,
+        proposal.refund_requested,
+        proposal.confidence,
+        len(turns),
     )
 
-    if result.intent == "refund":
+    if proposal.refund_requested:
         action = _handle_refund(
             conversation,
-            result,
+            proposal,
             message_id=latest.id,
             inbox=inbox,
             payments=payments,
             now=now,
         )
     else:
-        articles = help_centre.relevant(latest.content) if help_centre else []
-        if articles:
-            log.info(
-                "conversation %s answered from %s",
-                conversation.id,
-                ", ".join(article.title for article in articles),
-            )
-        reply = answer(latest.content, knowledge, articles)
-        inbox.send_reply(conversation.id, reply)
+        inbox.send_reply(conversation.id, proposal.reply)
         # Resolved rather than left open: Chatwoot reopens a conversation as
         # soon as the customer writes again, so nothing is lost and the inbox
         # does not fill up with conversations we have already dealt with.
@@ -367,7 +440,7 @@ def handle_conversation(
 
 def _handle_refund(
     conversation: Conversation,
-    result: Classification,
+    proposal: Proposal,
     *,
     message_id: int,
     inbox: Inbox,
@@ -379,19 +452,18 @@ def _handle_refund(
         if conversation.contact_email
         else None
     )
-    decision = refund_decision(charge, result.confidence, now=now)
+    decision = refund_decision(charge, proposal.confidence, now=now)
 
     if not decision.auto_approve:
         # Tell the customer something, then tell the team why. Posting only the
         # note leaves the customer staring at silence, which is indistinguishable
-        # from a broken agent: they asked for a refund and nothing came back. The
-        # acknowledgement deliberately says nothing about the outcome, since
-        # whether to refund is the human's decision, not ours.
-        inbox.send_reply(
-            conversation.id,
-            "Thanks for getting in touch. I've passed this to a colleague who "
-            "will look at your refund and come back to you shortly.",
-        )
+        # from a broken agent: they asked for a refund and nothing came back.
+        #
+        # The model's own reply is used, so a message that asked two things gets
+        # both addressed. It was told not to promise an outcome, and if it did
+        # anyway the safe wording replaces it: the customer must not be told
+        # their money is coming back when a human has not agreed to it.
+        inbox.send_reply(conversation.id, safe_holding_reply(proposal.reply))
         # Deliberately left open, and not resolved: a person still has to act.
         inbox.add_private_note(
             conversation.id,
@@ -427,8 +499,7 @@ def run_once(
     *,
     inbox: Inbox,
     payments: Payments,
-    classify: Classifier,
-    answer: Answerer,
+    understand: Understander,
     knowledge: str,
     help_centre: HelpCentre | None = None,
     handled: HandledMessages | None = None,
@@ -442,8 +513,7 @@ def run_once(
                 conversation,
                 inbox=inbox,
                 payments=payments,
-                classify=classify,
-                answer=answer,
+                understand=understand,
                 knowledge=knowledge,
                 help_centre=help_centre,
                 handled=handled,
@@ -770,35 +840,49 @@ class StripePayments:
 # Groq
 # --------------------------------------------------------------------------
 
-CLASSIFY_SCHEMA = {
-    "name": "intent",
+PROPOSAL_SCHEMA = {
+    "name": "proposal",
     "strict": True,
     "schema": {
         "type": "object",
         "properties": {
-            "intent": {"type": "string", "enum": ["refund", "support"]},
-            "confidence": {"type": "number"},
+            "reply": {"type": "string"},
+            "refund_requested": {"type": "boolean"},
+            # Number or string. The model reliably writes "0.95" with quotes
+            # for some inputs, and a validator that rejects it fails the whole
+            # request rather than degrading. `_parse` coerces and range-checks
+            # it anyway, so insisting on the JSON type here bought nothing and
+            # cost every retry.
+            "confidence": {"type": ["number", "string"]},
         },
-        "required": ["intent", "confidence"],
+        "required": ["reply", "refund_requested", "confidence"],
         "additionalProperties": False,
     },
 }
 
-# The prompt states the output contract as well as sending the schema. Relying
-# on the schema alone is a mistake: only some provider endpoints enforce it
-# with constrained decoding, and the rest treat `strict` as a suggestion. An
-# earlier version of this prompt said "reply with refund", which a
-# non-enforcing provider followed to the letter and returned prose.
-CLASSIFY_PROMPT = """You sort incoming customer support messages.
+# Appended after the behaviour guidance and the documentation, so the output
+# contract is the last thing read. Only one judgement is asked for beyond the
+# reply, and it is deliberately narrow: is this person asking us to send their
+# money back. Everything else the agent needs to do is just answering well.
+UNDERSTAND_RULES = """Write the next reply in this conversation.
 
-Classify the message as "refund" when the customer is asking for their money
-back. Everything else, including complaints, questions about billing and
-requests to cancel, is "support".
+Separately, decide one thing: is the customer asking us to refund a payment they
+have already made? That is a request about their own money. Questions about how
+refunds work, whether they are offered, or what would happen in some situation
+are not requests, and should be answered from the documentation.
+
+If it is a request, say you are looking into it. Do not say a refund has been
+made and do not promise one: whether it can be approved is decided after you
+reply, and you are not the one deciding.
+
+Reply as yourself, in the conversation, using what was said earlier. Do not
+repeat a greeting you have already given.
 
 Respond with a single JSON object and nothing else, of exactly this shape:
-{"intent": "refund" or "support", "confidence": number between 0 and 1}
+{"reply": "...", "refund_requested": true or false, "confidence": 0.95}
 
-confidence is how sure you are of the classification."""
+confidence is a number between 0 and 1 saying how sure you are about
+refund_requested. Write it as a bare number, not in quotes."""
 
 
 class Brain:
@@ -860,103 +944,102 @@ class Brain:
             transport=transport,
         )
 
-    INTENTS = ("refund", "support")
+    def understand(
+        self,
+        turns: Sequence[Turn],
+        knowledge: str,
+        articles: Sequence[Article] = (),
+    ) -> Proposal:
+        """Read the conversation and propose the next reply.
 
-    def classify(self, message: str) -> Classification:
-        """Classify one message, retrying if the reply is not usable.
+        One call, given the thread rather than a single message, returning both
+        the reply and whether a refund is being requested. It is a proposal: the
+        thresholds that decide whether money actually moves are applied
+        afterwards, in code, and are never shown to the model.
 
-        Only some provider endpoints enforce the schema with constrained
-        decoding. The rest generate JSON by following instructions, which is
-        probabilistic: it is usually right and occasionally malformed. Since
-        the model is stochastic, asking again is the appropriate response to an
-        unusable answer rather than crashing the poll.
+        This replaced a classify-then-branch design, where each message was
+        reduced to one of two labels before anything was understood. That shape
+        could not hold a conversation, because a label carries no context, and it
+        pushed every distinction into the rubric: "how do I get a refund?" was
+        read as a request and refunded twenty dollars until an example was added
+        forbidding it. The list of such examples has no end.
         """
+        system = [
+            "You are a customer support agent for a subscription business.",
+            "",
+            "How to behave:",
+            knowledge,
+        ]
+        if articles:
+            system += [
+                "",
+                "Documentation you may state as fact. Anything specific about the "
+                "product, its prices or its policies must come from here. Do not "
+                "add details that are not written below.",
+                "",
+            ]
+            system += [f"## {a.title}\n{a.content}" for a in articles]
+        else:
+            system += [
+                "",
+                "No documentation matched this conversation, so state nothing "
+                "specific about the product, its prices or its policies. Answer "
+                "generally if the question does not need them, otherwise say a "
+                "colleague will follow up.",
+            ]
+        system += ["", UNDERSTAND_RULES]
+
+        messages = [{"role": "system", "content": "\n".join(system)}]
+        messages += [{"role": t.role, "content": t.content} for t in turns]
+
         last_payload = ""
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             last_payload = self._chat(
-                [
-                    {"role": "system", "content": CLASSIFY_PROMPT},
-                    {"role": "user", "content": message},
-                ],
-                response_format={"type": "json_schema", "json_schema": CLASSIFY_SCHEMA},
+                messages,
+                response_format={"type": "json_schema", "json_schema": PROPOSAL_SCHEMA},
                 **self._provider_preferences(require_parameters=self._require_schema),
             )
-            classification = self._parse(last_payload)
-            if classification is not None:
-                return classification
+            proposal = self._parse(last_payload)
+            if proposal is not None:
+                return proposal
             log.warning(
-                "classification %s of %s was not usable: %r",
+                "proposal %s of %s was not usable: %r",
                 attempt,
                 self.MAX_ATTEMPTS,
                 last_payload[:120],
             )
 
         raise RuntimeError(
-            f"model did not return a usable classification after "
-            f"{self.MAX_ATTEMPTS} attempts. Last reply: {last_payload[:300]}"
+            f"model did not return a usable proposal after {self.MAX_ATTEMPTS} "
+            f"attempts. Last reply: {last_payload[:300]}"
         )
 
-    def _parse(self, payload: str) -> Classification | None:
-        """A classification, or None if the reply cannot be trusted.
+    @staticmethod
+    def _parse(payload: str) -> Proposal | None:
+        """A proposal, or None if the reply cannot be trusted.
 
-        An out-of-range confidence or an unknown intent is treated the same as
-        malformed JSON. Letting either through would quietly corrupt the refund
-        decision, which reads confidence as a number and compares it to a
-        threshold.
+        An empty reply, a non-boolean flag or an out-of-range confidence are all
+        treated like malformed JSON. Letting any of them through would corrupt
+        the refund decision, which compares that confidence against a threshold.
         """
         try:
             parsed = json.loads(payload)
-            intent = parsed["intent"]
+            reply = parsed["reply"]
+            refund_requested = parsed["refund_requested"]
             confidence = float(parsed["confidence"])
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             return None
 
-        if intent not in self.INTENTS or not 0.0 <= confidence <= 1.0:
+        if not isinstance(reply, str) or not reply.strip():
             return None
-        return Classification(intent=intent, confidence=confidence)
-
-    def answer(
-        self, message: str, knowledge: str, articles: Sequence[Article] = ()
-    ) -> str:
-        """Write a reply.
-
-        Two separate inputs, deliberately. `knowledge` is how to behave: tone,
-        when to ask a follow-up, and the standing rule never to invent. The
-        articles are what may be stated as fact. Keeping them apart is what lets
-        the documentation change without touching the instructions.
-        """
-        instructions = [
-            "You are a customer support agent.",
-            "",
-            "How to behave:",
-            knowledge,
-        ]
-        if articles:
-            instructions += [
-                "",
-                "Documentation you may state as fact. Use only what is here for "
-                "anything specific about the product, its prices or its "
-                "policies. Do not add details that are not written below.",
-                "",
-            ]
-            instructions += [
-                f"## {article.title}\n{article.content}" for article in articles
-            ]
-        else:
-            instructions += [
-                "",
-                "No documentation matched this question, so do not state "
-                "anything specific about the product, its prices or its "
-                "policies. Answer generally if you can, otherwise say a "
-                "colleague will follow up.",
-            ]
-
-        return self._chat(
-            [
-                {"role": "system", "content": "\n".join(instructions)},
-                {"role": "user", "content": message},
-            ],
-            **self._provider_preferences(),
+        if not isinstance(refund_requested, bool):
+            return None
+        if not 0.0 <= confidence <= 1.0:
+            return None
+        return Proposal(
+            reply=reply.strip(),
+            refund_requested=refund_requested,
+            confidence=confidence,
         )
 
     def _provider_preferences(self, *, require_parameters: bool = False) -> dict:
@@ -979,7 +1062,12 @@ class Brain:
     # genuinely malformed request just fails three times quickly and reports
     # the response body, which raise_for_status() would have hidden.
     RETRY_ON = {400, 408, 409, 425, 429, 500, 502, 503, 504}
-    MAX_ATTEMPTS = 3
+    # Five rather than three. Groq's constrained decoder intermittently answers
+    # json_validate_failed with an empty generation, and a request that failed
+    # three times in a row succeeded unchanged straight afterwards. Each failure
+    # is fast, so the extra attempts cost little and buy a demo that does not
+    # die on a bad patch.
+    MAX_ATTEMPTS = 5
 
     def _chat(self, messages: list[dict], **extra) -> str:
         payload = {
@@ -998,10 +1086,31 @@ class Brain:
                     f"model API returned {response.status_code} after {attempt} "
                     f"attempt(s): {response.text[:300]}"
                 )
-            delay = 2 ** (attempt - 1)
+            delay = self._retry_after(response) or 2 ** (attempt - 1)
             log.warning("model API returned %s, retrying in %ss", response.status_code, delay)
             self._sleep(delay)
         raise AssertionError("unreachable")
+
+    @staticmethod
+    def _retry_after(response: httpx.Response) -> float | None:
+        """How long the provider asked us to wait, if it said.
+
+        Worth honouring rather than guessing. Groq's free tier limits tokens per
+        minute, not just requests, and this agent sends a whole conversation plus
+        documentation in one call, so that ceiling arrives sooner than a request
+        count suggests. Backing off for one second when it asked for five just
+        burns the remaining attempts.
+        """
+        header = response.headers.get("retry-after", "")
+        try:
+            return min(float(header), 30.0)
+        except ValueError:
+            pass
+        # Groq puts the figure in the message rather than a header.
+        match = re.search(r"try again in ([0-9.]+)s", response.text)
+        if match:
+            return min(float(match.group(1)) + 0.5, 30.0)
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -1083,8 +1192,7 @@ def main() -> None:
         interval_seconds=interval,
         inbox=inbox,
         payments=payments,
-        classify=brain.classify,
-        answer=brain.answer,
+        understand=brain.understand,
         help_centre=help_centre,
     )
 

@@ -23,14 +23,31 @@ Chatwoot widget
 GET /conversations?status=open          poll, no webhooks, no tunnel
       │
       ▼
-classify → {intent, confidence}          OpenRouter, strict JSON schema
+the conversation so far + knowledge.md + matching articles
       │
-      ├── refund  → refund_decision()    pure function, no model
-      │               ├── passes → Stripe refund + reply + resolve
-      │               └── fails  → private note, left open for a human
+      ▼
+understand → {reply, refund_requested, confidence}    one model call
       │
-      └── support → help centre articles + knowledge.md → reply + resolve
+      ├── refund_requested → refund_decision()   pure function, no model
+      │        ├── passes → Stripe refund, then a reply stating the amount
+      │        └── fails  → the model's reply, plus a private note, left open
+      │
+      └── otherwise → the model's reply + resolve
 ```
+
+**The model proposes; code decides.** It reads the thread and writes the next
+reply, and says separately whether a refund is being requested. Whether money
+moves is settled afterwards against thresholds it never sees.
+
+This replaced a design that reduced each message to one of two labels before
+anything was understood, and it was replaced for two reasons. It could not hold a
+conversation, because only the newest message was ever sent: "it was due last
+Tuesday" is unanswerable on its own. And every distinction had to be written into
+the rubric in advance, which does not converge. "How do I get a refund?" was read
+as a request and refunded twenty dollars, and adding a counter-example only
+postpones the next phrasing. Now that question is simply answered from the
+refunds article, because nothing forces a branch before the model has read
+anything.
 
 Only the newest message decides whether we act: if we spoke last, the
 conversation is skipped. That is what keeps a polling loop from replying

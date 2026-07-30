@@ -32,6 +32,7 @@ from agent import (  # noqa: E402
     Brain,
     ChatwootInbox,
     StripePayments,
+    Turn,
     env_value,
     handle_conversation,
     load_env_file,
@@ -242,20 +243,24 @@ def main() -> int:
                     candidate,
                     inbox=inbox,
                     payments=payments,
-                    classify=brain.classify,
-                    answer=brain.answer,
+                    understand=brain.understand,
                     knowledge=knowledge,
                 )
         raise AssertionError(f"conversation {conversation_id} not visible")
 
     # ---------------------------------------------------------- model only
     print("\n1. the model classifies (real call)")
-    refund_call = brain.classify("I want my money back for the bootcamp")
-    check("refund wording classified as refund", refund_call.intent == "refund",
-          f"{refund_call.intent} @ {refund_call.confidence:.2f}")
-    support_call = brain.classify("I can't log in, the reset email never arrives")
-    check("login problem classified as support", support_call.intent == "support",
-          f"{support_call.intent} @ {support_call.confidence:.2f}")
+    refund_call = brain.understand(
+        (Turn(role="user", content="I want my money back for the bootcamp"),),
+        knowledge,
+    )
+    check("a refund request is recognised", refund_call.refund_requested,
+          f"refund_requested={refund_call.refund_requested} @ {refund_call.confidence:.2f}")
+    support_call = brain.understand(
+        (Turn(role="user", content="my delivery has not arrived"),), knowledge
+    )
+    check("a support question is not", not support_call.refund_requested,
+          f"refund_requested={support_call.refund_requested}")
 
     # ------------------------------------------------------- support path
     print("\n2. support question answered from knowledge.md")

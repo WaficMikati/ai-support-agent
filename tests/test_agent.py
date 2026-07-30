@@ -13,9 +13,9 @@ from agent import (
     MAX_AUTO_REFUND_CENTS,
     MAX_CHARGE_AGE_DAYS,
     Charge,
-    Classification,
     Conversation,
     Message,
+    Proposal,
     handle_conversation,
     needs_reply,
     refund_decision,
@@ -84,12 +84,14 @@ def conversation(
     )
 
 
-def classifier(intent, confidence=0.95):
-    return lambda message: Classification(intent=intent, confidence=confidence)
-
-
-def answerer(text="here is your answer"):
-    return lambda message, knowledge, articles=(): text
+def understander(intent="support", confidence=0.95, text="here is your answer"):
+    """Stands in for the model: proposes a reply and whether a refund is asked
+    for."""
+    return lambda turns, knowledge, articles=(): Proposal(
+        reply=text,
+        refund_requested=intent == "refund",
+        confidence=confidence,
+    )
 
 
 def run(conv, *, inbox=None, payments=None, intent="support", confidence=0.95):
@@ -99,8 +101,7 @@ def run(conv, *, inbox=None, payments=None, intent="support", confidence=0.95):
         conv,
         inbox=inbox,
         payments=payments,
-        classify=classifier(intent, confidence),
-        answer=answerer(),
+        understand=understander(intent, confidence),
         knowledge="guidance",
         now=NOW,
     )
@@ -194,8 +195,7 @@ def test_loop_skips_conversations_we_already_answered():
     actions = run_once(
         inbox=inbox,
         payments=FakePayments(),
-        classify=classifier("support"),
-        answer=answerer(),
+        understand=understander("support"),
         knowledge="guidance",
     )
     assert actions == []
@@ -244,19 +244,42 @@ def test_a_held_refund_still_tells_the_customer_something():
     )
     assert action == "flagged"
     assert len(inbox.replies) == 1, "the customer must not be left in silence"
-    assert "colleague" in inbox.replies[0][1]
 
 
-def test_the_acknowledgement_does_not_promise_a_refund():
-    """Whether to refund is the human's decision, so the holding message must
-    not imply the answer."""
+def test_a_held_refund_uses_the_reply_the_model_wrote():
+    """So a message that asked two things gets both addressed, rather than a
+    fixed sentence about refunds only."""
     payments = FakePayments(charge(amount_cents=90_000))
-    _, inbox, _ = run(
-        conversation("refund please"), payments=payments, intent="refund"
+    inbox = FakeInbox()
+    handle_conversation(
+        conversation("cancel me and refund this month"),
+        inbox=inbox,
+        payments=payments,
+        understand=understander("refund", text="I have cancelled your subscription."),
+        knowledge="guidance",
+        now=NOW,
+    )
+    assert inbox.replies[0][1] == "I have cancelled your subscription."
+
+
+def test_a_held_refund_never_tells_the_customer_money_is_coming():
+    """Whether to refund is the human's decision. If the model promises anyway,
+    the safe wording replaces it."""
+    payments = FakePayments(charge(amount_cents=90_000))
+    inbox = FakeInbox()
+    handle_conversation(
+        conversation("refund please"),
+        inbox=inbox,
+        payments=payments,
+        understand=understander(
+            "refund", text="Good news, that's refunded and on its way back!"
+        ),
+        knowledge="guidance",
+        now=NOW,
     )
     said = inbox.replies[0][1].lower()
-    assert "refunded" not in said
     assert "on its way back" not in said
+    assert "colleague" in said
 
 
 def test_a_held_refund_is_not_resolved():
@@ -342,3 +365,37 @@ def test_nothing_happens_when_we_spoke_last(intent):
     assert inbox.replies == []
     assert inbox.notes == []
     assert payments.refunded == []
+
+
+# ------------------------------------------------- the promise safety net
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "That's refunded, 20.00 is on its way back to you.",
+        "Your refund has been processed.",
+        "I have issued your refund today.",
+        "You will receive the money within a few days.",
+        "The money is back to your card already.",
+    ],
+)
+def test_a_reply_promising_a_refund_is_replaced(reply):
+    from agent import HOLDING_REPLY, safe_holding_reply
+
+    assert safe_holding_reply(reply) == HOLDING_REPLY
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Thanks, I'm looking into that now.",
+        "I've asked a colleague to check your payment.",
+        "Sorry about the stale bag. Let me get someone to look at this.",
+        "I have cancelled your subscription, and I'm checking the payment.",
+    ],
+)
+def test_an_honest_reply_is_left_alone(reply):
+    from agent import safe_holding_reply
+
+    assert safe_holding_reply(reply) == reply
