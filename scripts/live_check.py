@@ -12,6 +12,7 @@ and no payment provider: it only exercises the inbox.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,7 +42,33 @@ def load_config() -> dict[str, str]:
     return values
 
 
+def agent_already_running() -> bool:
+    """True if a polling agent is up.
+
+    This script posts messages and then asserts on what the adapter sees. A
+    running agent replies to the same conversations, so the message it asserts
+    on is no longer the newest one and "read as incoming" fails. That failure
+    reads like a broken adapter, which is the wrong place to go looking.
+    """
+    try:
+        found = subprocess.run(
+            ["pgrep", "-f", "python agent.py"], capture_output=True, text=True, timeout=10
+        )
+        return found.returncode == 0 and bool(found.stdout.strip())
+    except Exception:
+        return False
+
+
 def main() -> int:
+    if agent_already_running() and "--allow-agent" not in sys.argv:
+        print(
+            "REFUSING TO RUN: agent.py is polling.\n"
+            "  It replies to these conversations too, so the assertions about\n"
+            "  what the adapter sees would fail for the wrong reason. Stop the\n"
+            "  agent, or pass --allow-agent if you know what you are looking at."
+        )
+        return 1
+
     config = load_config()
     base_url = config["chatwoot_url"]
     token = config["access_token"]

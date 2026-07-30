@@ -392,9 +392,14 @@ uv run python scripts/classify_eval.py # labelled messages through the refund ju
 adapters and the loop are all checked in isolation.
 
 The live scripts need Chatwoot running and a filled-in `.env`. **Stop the agent
-before running `e2e_check.py`** — it drives the same conversations itself, so a
-polling agent handles them in parallel and the assertions about a single reply
-fail. It refuses to run if it detects one.
+before `e2e_check.py` and `live_check.py`.** Both drive conversations themselves,
+so a polling agent handles the same ones in parallel and the assertions fail for
+the wrong reason: a reply arrives that the script did not send, and the failure
+looks like a bug in the agent rather than two processes doing one job. Both
+refuse to run if they detect a polling agent, so this is a message rather than a
+mystery. `reload_check.py` needs no such care: it starts and stops its own agent,
+since the thing it proves is that editing `knowledge.md` mid-run takes effect
+without a restart.
 
 `classify_eval.py` is the regression test for the judgement that decides whether
 code may move money. That behaviour lives in a prompt, not a branch, so unit
