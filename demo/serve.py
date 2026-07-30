@@ -100,8 +100,33 @@ class DemoHandler(SimpleHTTPRequestHandler):
         self.send_response(200 if body["ok"] else 500)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        if body["ok"]:
+            # Delete the widget's visitor token from here rather than from the
+            # page. This is the only thing that actually starts a new
+            # conversation: setUser creates the new contact server-side but does
+            # not re-issue this cookie, and the cookie is what binds the browser
+            # to a conversation, so the old thread kept coming back. The widget
+            # mints a fresh token on load when it finds no cookie.
+            #
+            # Cookies ignore the port, so clearing it for host "localhost" from
+            # :8080 also clears the one the widget set from :3000.
+            self.send_header(
+                "Set-Cookie",
+                "cw_conversation=; Max-Age=0; Path=/; SameSite=Lax",
+            )
         self.end_headers()
         self.wfile.write(payload)
+
+    def end_headers(self) -> None:
+        # Never let the browser cache the page. Editing the demo and having a tab
+        # keep running the previous JavaScript is very hard to diagnose from the
+        # outside: the reset button still calls the server and still succeeds, so
+        # the logs look perfectly healthy while the page behaves like an older
+        # version of itself.
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        super().end_headers()
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002
         # Quiet about page assets; the reset is the only interesting request.

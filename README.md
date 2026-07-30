@@ -166,6 +166,13 @@ beneath it is a separate per-inbox setting whose fastest option is "in a few
 minutes", so it understates the agent and cannot be improved without patching
 the widget.
 
+**Turn off rate limiting, or repeated resets stop the widget loading at all.**
+Chatwoot throttles its widget endpoints per IP, and everything in a local demo
+comes from one address. Reloading and resetting a handful of times in quick
+succession earns a 429 on `/widget`, after which the chat bubble simply does not
+appear, with nothing in the UI to say why. Add `ENABLE_RACK_ATTACK=false` to
+`deploy/.env` and restart `rails`.
+
 ### 2. Email (optional)
 
 The compose file includes a **GreenMail** container: a real IMAP and SMTP

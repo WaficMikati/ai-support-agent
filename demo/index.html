@@ -44,9 +44,31 @@
       };
     })(document, "script");
 
-    var CUSTOMER = { email: "demo@example.com", name: "Demo Customer" };
+    var DEFAULT_VISITOR = {
+      identifier: "demo-visitor",
+      email: "demo@example.com",
+      name: "Demo Customer",
+    };
 
-    // Report who we came back as, after a reset reloads the page.
+    // Who this browser is currently pretending to be. Kept in localStorage so
+    // it survives the reload a reset performs. Without this the reset rotated
+    // the identity, reloaded, and the ready handler below immediately put the
+    // original customer back, so the same conversation reappeared and the reset
+    // looked like it had done nothing.
+    function currentVisitor() {
+      try {
+        return JSON.parse(localStorage.getItem("demoVisitor")) || DEFAULT_VISITOR;
+      } catch (e) {
+        return DEFAULT_VISITOR;
+      }
+    }
+
+    function rememberVisitor(visitor) {
+      try {
+        localStorage.setItem("demoVisitor", JSON.stringify(visitor));
+      } catch (e) { /* private mode; the reset still works for this session */ }
+    }
+
     (function () {
       var afterReset = sessionStorage.getItem("demoResetEmail");
       if (afterReset) {
@@ -63,7 +85,11 @@
     // email, and the refund path has an address to match against Stripe. An
     // anonymous visitor can never be matched to a charge.
     window.addEventListener("chatwoot:ready", function () {
-      window.$chatwoot.setUser("demo-visitor", CUSTOMER);
+      var visitor = currentVisitor();
+      window.$chatwoot.setUser(visitor.identifier, {
+        email: visitor.email,
+        name: visitor.name,
+      });
     });
 
     // A fresh conversation means a fresh customer. $chatwoot.reset() does not
@@ -81,16 +107,22 @@
         .then(function (response) { return response.json(); })
         .then(function (body) {
           if (!body.ok) throw new Error(body.error || "reset failed");
-          window.$chatwoot.setUser(body.identifier, {
+          // Remember before reloading, so the ready handler identifies as the
+          // new customer rather than putting the old one back.
+          rememberVisitor({
+            identifier: body.identifier,
             email: body.email,
             name: body.name,
           });
-          // The reload is required, not cosmetic. setUser swaps the identity
-          // but the widget's websocket stays subscribed to the previous one, so
-          // messages still send while replies are published to a channel this
-          // page is no longer listening on: the visitor sees silence while the
-          // agent thinks it answered. Reloading re-subscribes as the new
-          // customer, whose identity is already in the cookie by now.
+          // Deliberately NOT calling setUser here. Doing so attaches the new
+          // identity to the contact we are about to abandon, and Chatwoot allows
+          // one contact per identifier and per email, so after the reload the
+          // fresh contact cannot claim them: setUser fails silently and the
+          // visitor stays anonymous, which means refunds never match a charge.
+          //
+          // The server has already cleared the visitor cookie, so reloading
+          // makes the widget mint a brand new contact, and the ready handler
+          // above claims the identity for that one instead.
           sessionStorage.setItem("demoResetEmail", body.email);
           note.textContent = "Fresh conversation ready, reloading…";
           location.reload();
