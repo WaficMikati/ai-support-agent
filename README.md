@@ -116,6 +116,22 @@ messages on a widget inbox with *"Incoming messages are only allowed in Api
 inboxes"*. The `/public/api/v1/inboxes/...` endpoints resolve the API
 channel, not the widget, which has its own `/api/v1/widget/...` flow.
 
+**Turn off auto-offline, or the widget tells visitors nobody is there.**
+Chatwoot decides online or away from human agent presence, meaning a live
+dashboard websocket. This agent authenticates with an API token and never opens
+one, so by default the widget greets visitors with *"We are away at the moment.
+We will be back as soon as possible"* — from something that answers in seconds.
+
+```bash
+docker compose exec rails bundle exec rails runner \
+  'AccountUser.find_by(user_id: User.find_by(email: "ops@example.com").id).update!(auto_offline: false, availability: :online)'
+```
+
+The widget then shows a green dot and "We are online". The reply-time line
+beneath it is a separate per-inbox setting whose fastest option is "in a few
+minutes", so it understates the agent and cannot be improved without patching
+the widget.
+
 ### 2. Email (optional)
 
 The compose file includes a **GreenMail** container: a real IMAP and SMTP
