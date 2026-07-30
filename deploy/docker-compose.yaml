@@ -53,6 +53,24 @@ services:
     volumes:
       - redis_data:/data
 
+  # A real IMAP and SMTP server, so the email channel can be set up and proven
+  # without anybody's mailbox credentials. Swapping in Gmail later is a change
+  # of host, login and port on the Chatwoot inbox, nothing more.
+  greenmail:
+    image: greenmail/standalone:2.1.9
+    restart: always
+    environment:
+      - |
+        GREENMAIL_OPTS=-Dgreenmail.setup.test.all
+        -Dgreenmail.hostname=0.0.0.0
+        -Dgreenmail.users=support:supportpass@chatwoot.test,customer:customerpass@chatwoot.test
+        -Dgreenmail.auth.disabled=false
+        -Dgreenmail.verbose
+    ports:
+      # smtp / imap, on the host too so test scripts can reach them
+      - '127.0.0.1:3025:3025'
+      - '127.0.0.1:3143:3143'
+
 volumes:
   storage_data:
   postgres_data:

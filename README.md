@@ -93,7 +93,43 @@ messages on a widget inbox with *"Incoming messages are only allowed in Api
 inboxes"*. The `/public/api/v1/inboxes/...` endpoints resolve the API
 channel, not the widget, which has its own `/api/v1/widget/...` flow.
 
-### 2. The agent
+### 2. Email (optional)
+
+The compose file includes a **GreenMail** container: a real IMAP and SMTP
+server, so the email channel can be set up and proven without anybody's
+mailbox credentials. Mailboxes are `support@chatwoot.test` (login `support`)
+and `customer@chatwoot.test` (login `customer`), on ports 3025 for SMTP and
+3143 for IMAP.
+
+Create an Email inbox and point IMAP and SMTP at host `greenmail`. Three
+things are easy to get wrong here, all of them found the hard way:
+
+- **Set `imap_authentication` to `login`, not the default `plain`.** Chatwoot's
+  default issues `AUTHENTICATE PLAIN`, which many servers, GreenMail included,
+  do not advertise. `login` uses the plain `LOGIN` command instead. Chatwoot
+  accepts `plain`, `login` or `cram-md5` per inbox.
+- **The IMAP login is not always the email address.** For GreenMail it is
+  `support`, and logging in with the full address makes it try to create a
+  second user and drop the connection.
+- **Test emails need a `Message-ID` header.** Chatwoot silently discards mail
+  without one, with no error anywhere. Real clients always set it; hand-built
+  test messages often do not.
+
+Chatwoot fetches on a schedule, so email is not instant. To pull immediately:
+
+```bash
+docker compose exec rails bundle exec rails runner \
+  'Inboxes::FetchImapEmailsJob.perform_now(Channel::Email.find_by(email: "support@chatwoot.test"))'
+```
+
+Note that Chatwoot passes the message through **unmodified**: signatures and
+quoted reply chains reach the classifier intact. That tested fine, but it is
+worth knowing that the model sees the whole thing.
+
+Swapping in a real mailbox is a change of host, port, login and password on
+the inbox. Nothing in the agent changes.
+
+### 3. The agent
 
 ```bash
 uv sync
