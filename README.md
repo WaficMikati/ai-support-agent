@@ -12,8 +12,9 @@ Built as the worked example for a two-part workshop:
 - **Session one** — the widget, the polling loop, and answering from
   documentation. Ends with a working agent on your own page that cannot act on
   anything.
-- **Session two** — the refund path: the rules, the human hand-off, and scoped
-  credentials that only permit one operation.
+- **Session two** — giving it tools, then the refund path: the rules, the human
+  hand-off, and scoped credentials that only permit one operation. The tools it
+  gets are read-only, and that turns out to be the whole argument.
 
 It is a demo. It refuses to start against a live Stripe key.
 
@@ -31,7 +32,11 @@ Chatwoot  ──poll──▶  the conversation so far
                      + the articles that match (your help centre)
                             │
                             ▼
-                     one model call
+                  ┌──── gather ────┐          read-only tools
+                  │  may call      │◀────────  get_last_purchase
+                  └────────┬───────┘           (bounded, 3 rounds)
+                           ▼
+                     one more call, schema enforced
                             │
                      {reply, refund_requested, three rubric signals}
                             │
@@ -44,15 +49,17 @@ Chatwoot  ──poll──▶  the conversation so far
     ┌─────────┴─────────┐
   passes              fails
     │                   │
- refund via         reply, plus a private
- Stripe, then       note for a colleague,
- say the amount     conversation left open
+ refund via         say why a person is needed,
+ Stripe, then       leave it open, and note the
+ say the amount     reason for a colleague
+    │
+ note the checks it passed
 ```
 
-**The model proposes; code decides.** It reads the thread and writes the next
-reply, and separately says whether the customer is asking for a refund. Whether
-that refund actually happens is settled afterwards, in code, against thresholds
-the model never sees.
+**The model proposes; code decides.** It reads the thread, may look a payment
+up, and writes the next reply. Separately it says whether the customer is asking
+for a refund. Whether that refund actually happens is settled afterwards, in
+code, against thresholds the model never sees.
 
 That flow is written as a graph, because the routing is the interesting part:
 
@@ -77,6 +84,53 @@ No framework, and none needed: a graph is a dict of functions and a dict of
 routing rules. The edge out of `understand` is the model's choice. The edge out
 of `refund` belongs to `refund_decision`. The model can ask for money to move; it
 cannot make it move.
+
+---
+
+## What the model may look up
+
+Ask it *"how much was my last purchase?"* and it answers, because it can call a
+tool before replying:
+
+```python
+TOOL_SPECS = {"get_last_purchase": {...  "parameters": {"type": "object",
+                                                        "properties": {}}}}
+```
+
+Two things about that definition matter more than the mechanism.
+
+**Every tool is read-only.** Nothing that writes is exposed, so a tool loop can
+never move money. The model may look a payment up and discuss it; whether a
+refund happens is still `refund_decision`, in code, after the model has
+finished. There is a test asserting no tool name can spend.
+
+**Every tool takes no arguments.** This is the security property rather than a
+simplification. A lookup accepting an email address would let the model pass
+along whatever the customer typed, so anybody could read a stranger's payment
+history by naming their address. Who the customer is comes from Chatwoot's
+contact record — set when they signed in — and is bound by the caller. The model
+chooses *whether* to look, never *whose* record to look at. Also tested.
+
+### Why it takes two calls
+
+Groq refuses `tools` and `response_format` in the same request:
+
+```
+json mode cannot be combined with tool/function calling
+```
+
+So the model first gathers, with tools and no schema, and is then asked for the
+proposal with whatever it found already in the conversation. The loop stops as
+soon as it answers instead of calling something, and is capped at three rounds
+so a model that keeps asking for the same thing cannot spin.
+
+That shape is kept even where a provider would allow one call. A second path
+that only some providers exercise is a second path that breaks unnoticed.
+
+**It is not free.** Offering tools costs two model calls per message even when
+nothing is looked up, and three when something is. Against a free tier that
+meters tokens per day, a conversation is roughly twice what it used to be. See
+[Watching the token budget](#watching-the-token-budget).
 
 ---
 
@@ -232,14 +286,50 @@ Open <http://localhost:8080>, click the chat bubble, and ask something:
 
 - *"can I skip a month?"* — answered from the help centre
 - *"do you have decaf?"* — answered from the help centre
+- *"how much was my last purchase?"* — looked up, not asked back
 - *"how do I get a refund?"* — explains the process, and does **not** refund you
 - *"I need a refund"* — actually refunds, in Stripe test mode
 
-Replies take one to three seconds.
+Replies take two to five seconds, longer when a lookup happens.
 
-**Start a fresh conversation** on the page resolves the open queue, creates a new
-customer with a refundable payment, and reloads. Use it between runs; a plain
-refresh resumes the same conversation.
+### Setting the customer up
+
+**Start a fresh conversation** resolves the open queue, builds a new customer in
+Stripe, and reloads. Use it between runs; a plain refresh resumes the same
+conversation.
+
+The selectors above the button decide what that customer looks like, so every
+branch of the policy can be shown rather than described:
+
+| Account history | What the refund does |
+|---|---|
+| One payment, nothing refunded | refunds automatically |
+| That payment is already refunded | held, already refunded |
+| That payment is disputed with the bank | held, disputed |
+| An earlier payment was refunded before | held, earlier refunds |
+| Two payments, neither refunded | held, cannot tell which |
+| No payments at all | held, nothing on the account |
+
+Amount and date appear wherever there is a payment to give them to, and they
+feed the lookup as well as the policy, so a refunded payment still has an amount
+and a date to talk about. Two payments get their own of each, since identical
+ones give the customer nothing to point at.
+
+The line underneath states what to expect. It works out which check will fire
+first, in the order the policy uses, so choosing *$90.00* alongside *an earlier
+payment was refunded* correctly says "over the auto-approval limit" — that is
+what the policy really does, since it stops at the first failure.
+
+The private notes in Chatwoot are the other half of the demo: open the
+conversation there and the reason is written out, for approvals as well as
+refusals.
+
+**One condition cannot be set up this way.** Stripe stamps `created` itself and
+will not take one, and a test clock backdates the customer but not their charges,
+so the date is carried in the charge's metadata and applied when it is read back.
+The fiction lives in the data; `refund_decision` still just compares two
+timestamps. It cannot reach a real payment, because the agent refuses to start
+against anything but a Stripe test key.
 
 ---
 
@@ -262,7 +352,7 @@ scripts/
   e2e_check.py            everything live: model, Stripe test mode, Chatwoot
   reload_check.py         proves editing knowledge.md needs no restart
   classify_eval.py        labelled messages, scoring the refund judgement
-tests/                    183 tests, no network and no credentials needed
+tests/                    218 tests, no network and no credentials needed
 notes/                    answers to questions this raised, written up as they came
 ```
 
@@ -278,10 +368,12 @@ One file, read top to bottom:
 |---|---|
 | Configuration | the `.env` reader, and the refund numbers as named constants |
 | Types | `Message`, `Conversation`, `Proposal`, `Charge`, `Decision` |
+| Tool specs | what the model may call, and the guidance for calling it |
 | Ports | what an inbox, a payment provider and a model must offer |
 | The refund rules | `refund_decision`. A pure function: no I/O, no model |
 | Ours to touch | who spoke last, and what has been handled already |
-| The graph | `State`, the nodes, the edges, and the six-line walk |
+| What a hold says | one sentence per reason, and the approval note |
+| The graph | `State`, the nodes, the edges, the six-line walk, and `account_tools` |
 | Handling one conversation | builds the state and walks the graph once |
 | The loop | poll, handle, sleep |
 | Adapters | Chatwoot, the help centre, Stripe, the model |
@@ -322,10 +414,69 @@ Auto-approval needs **all** of:
 | Previous refunds on the account | none |
 | Rubric score at or above | `MIN_CONFIDENCE` = 0.6, two of three points |
 | Charge not already refunded, in full or in part | — |
+| Charge not disputed with the card issuer | — |
 | Exactly one refundable charge on the account, not none and not several | — |
 
-Anything else tells the customer a colleague will follow up, posts a private note
-with the reason, leaves the conversation open, and touches no money.
+**A disputed charge is never auto-refunded**, whatever it costs and however
+recent. The customer has already gone to their bank, Stripe is holding the
+amount, and the card network decides the case; refunding on top is how you pay
+twice. It is checked before the already-refunded rule, because a charge can be
+both and the dispute is the more serious thing to report.
+
+Anything that fails leaves the conversation open, touches no money, posts a
+private note with the check that failed, and tells the customer what happened.
+
+### What the customer is told
+
+The model writes its reply before the policy runs, so it cannot know a person is
+about to take over. Left to itself it tends to ask which payment was meant, and
+by the time that arrives the question is moot. Code knows exactly which check
+failed, so it says that instead:
+
+| Why it held | What the customer reads |
+|---|---|
+| already refunded | "It looks like that payment has already been refunded." |
+| disputed | "That payment is already being disputed with your bank…" |
+| more than one payment | "…so I would rather not guess which one you mean." |
+| too large | "A refund of that amount needs a colleague to approve it." |
+| too old | "That payment is older than I am able to refund automatically." |
+| earlier refunds | "Because of earlier refunds on your account…" |
+| nothing on the account | "I'm sorry, I couldn't find any payments on this account." |
+
+Each is followed by the same commitment, written in code because somebody has to
+keep it: *"I have sent your refund request to my colleague for review. You should
+receive an email within the next 24 hours."*
+
+No explanation quotes a threshold. The colleague's note gives the figure; the
+customer gets the shape of the problem without the policy being read back at
+them. There is a test for that, since a number would be easy to leak in later.
+
+One case deliberately keeps the model's own words: a hedged request. There the
+doubt is about what the customer meant rather than about the payment, so
+whatever it asked back is more use than a flat statement.
+
+### Approvals are recorded too
+
+A refusal always explained itself while an approval left one line on stdout,
+which is backwards: the approvals are where money moved with nobody watching.
+Both now leave a private note. An approved one reads:
+
+```
+Refund issued automatically: 20.00
+Charge ch_3Tywpa…, refund re_3Tywpa…
+
+Every check passed:
+  amount 20.00, limit 50.00
+  0 days old, limit 30
+  earlier refunds on the account: 0
+  not already refunded
+  not disputed
+  other refundable charges: 0
+  rubric 0.67, minimum 0.6 (clear request: yes, charge identified: no, hedging: no)
+```
+
+Limits are quoted rather than described, so an old note still says what the rule
+was at the time if the constants change.
 
 **Confidence is scored, not self-reported.** The model is never asked how sure it
 is. It answers three plain questions about the message and the score is
@@ -389,11 +540,11 @@ with nothing before it.
 ## Checking it works
 
 ```bash
-uv run pytest                          # 183 tests, no network, no credentials
-uv run python scripts/live_check.py    # the inbox adapter against live Chatwoot
-uv run python scripts/e2e_check.py     # everything live, including a real refund
-uv run python scripts/reload_check.py  # editing knowledge.md with the agent running
-uv run python scripts/classify_eval.py # labelled messages through the refund judgement
+uv run pytest                                   # 218 tests, no network, no credentials
+uv run python scripts/live_check.py             # the inbox adapter against live Chatwoot
+uv run python scripts/e2e_check.py              # everything live, including a real refund
+uv run python scripts/reload_check.py           # editing knowledge.md with the agent running
+uv run python scripts/classify_eval.py --quick  # the refund judgement, six phrasings
 ```
 
 `pytest` fakes Chatwoot, Stripe and the model, so the policy, the graph, the
@@ -415,6 +566,46 @@ tests cannot cover it. It reports failures by direction, because they are not
 equally bad: answering a refund request with a reply is an annoyance, refunding
 somebody who only asked a question is a real problem.
 
+It sends what the agent sends — the guidance, the matching articles, the lookup
+tool. It did not always, and the difference is not cosmetic: *"how do i get a
+refund?"* reads as a request with nothing else in the prompt and as a question
+once the Refunds article sits beside it. Every failure it reported that way was
+unreproducible in the running agent.
+
+| | |
+|---|---|
+| `--quick` | six phrasings that have actually gone wrong. Before a demo. |
+| *(no flag)* | all 22. After one. |
+| `--bare` | guidance only, for comparing the two configurations. |
+
+---
+
+## Watching the token budget
+
+Worth its own heading because it is the thing most likely to stop a demo.
+
+A free Groq account allows **200,000 tokens a day**. Every message costs roughly
+**4–7k**: the prompt carries `knowledge.md`, three help-centre articles and the
+conversation, and tool calling sends that two or three times. Call it **30 to 50
+messages for the whole day**.
+
+The checks are the expensive part, not the chatting. `e2e_check.py` and a full
+`classify_eval.py` will spend a meaningful slice of a day between them, and it is
+entirely possible to empty the budget verifying the demo and have nothing left to
+run it with. Use `--quick` beforehand and save the full sweeps for afterwards.
+
+When it runs out the agent does not fail quietly:
+
+```
+RuntimeError: model API returned 429 after 5 attempt(s):
+  Rate limit reached ... on tokens per day (TPD): Limit 200000, Used 199019
+```
+
+Limits are per model and per organisation, so switching `MODEL_NAME` to another
+Groq model, or using a key from a different account, both give a fresh budget.
+An OpenRouter account with credit on it is metered in requests per day rather
+than tokens, which is roomier for this shape of workload.
+
 ---
 
 ## Changing it
@@ -424,8 +615,16 @@ somebody who only asked a question is a real problem.
 | Tone, when to ask a follow-up | `knowledge.md` — takes effect within seconds |
 | The facts it may state | Articles in your Chatwoot help centre |
 | Refund thresholds | The constants at the top of `agent.py` |
+| What a held refund says | `HELD_EXPLANATIONS` in `agent.py` |
+| What it can look up | `TOOL_SPECS` and `account_tools` — read-only, no arguments |
 | The model or provider | `OPENROUTER_MODEL`, `OPENROUTER_BASE_URL` in `.env` |
 | How fast it replies | `POLL_INTERVAL_SECONDS` in `.env`, default 5 |
+
+Adding a tool means a spec in `TOOL_SPECS` and an entry in `account_tools`, which
+closes over the conversation's own contact. Keep both properties: no arguments,
+and nothing that writes. A tool that took an identifier would let the customer
+choose whose record is read, and a tool that wrote would put the model back in
+charge of the thing `refund_decision` exists to decide.
 
 ### Using a different model
 
