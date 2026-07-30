@@ -70,7 +70,16 @@ def clear_queue(config: dict[str, str]) -> int:
     return cleared
 
 
-def new_customer() -> dict[str, str]:
+# Each of these builds an account that fails a different check in
+# refund_decision, so the policy can be demonstrated rather than described.
+#
+# There is one condition that cannot be set up this way: MAX_CHARGE_AGE_DAYS.
+# Stripe stamps `created` itself and will not accept one, so a charge is always
+# from today and "too old" cannot be reached with a real test charge.
+HISTORIES = ("clean", "refunded", "prior", "multiple", "none")
+
+
+def new_customer(amount_cents: int = 0, history: str = "clean") -> dict[str, str]:
     """Provision a brand new customer for a fresh conversation.
 
     Deliberately not by deleting anything. Two constraints force this shape:
@@ -81,12 +90,15 @@ def new_customer() -> dict[str, str]:
         something gone, and setUser against a stale token fails silently, so
         the next visitor ends up anonymous and refunds stop matching
 
-    So each reset mints a unique address, gives it a refundable charge in
-    Stripe, and the page identifies itself as that person.
+    So each reset mints a unique address, gives it whatever payment history was
+    asked for, and the page identifies itself as that person.
     """
     config = reset_demo.settings()
     stamp = str(int(time.time()))
     email = f"demo+{stamp}@example.com"
+    amount = amount_cents or reset_demo.DEMO_AMOUNT_CENTS
+    if history not in HISTORIES:
+        history = "clean"
 
     setup_key = config.get("STRIPE_SETUP_KEY", "")
     if setup_key.startswith("sk_test_"):
@@ -99,18 +111,47 @@ def new_customer() -> dict[str, str]:
             "/customers", data={"email": email, "source": "tok_visa"}
         )
         customer.raise_for_status()
-        charge = client.post(
-            "/charges",
-            data={
-                "amount": reset_demo.DEMO_AMOUNT_CENTS,
-                "currency": "usd",
-                "customer": customer.json()["id"],
-                "description": "demo subscription payment",
-            },
-        )
-        charge.raise_for_status()
+        customer_id = customer.json()["id"]
 
-    return {"email": email, "identifier": f"demo-{stamp}", "name": "Demo Customer"}
+        def charge_for(cents: int, description: str) -> str:
+            made = client.post(
+                "/charges",
+                data={
+                    "amount": cents,
+                    "currency": "usd",
+                    "customer": customer_id,
+                    "description": description,
+                },
+            )
+            made.raise_for_status()
+            return made.json()["id"]
+
+        def refund(charge_id: str) -> None:
+            done = client.post("/refunds", data={"charge": charge_id})
+            done.raise_for_status()
+
+        if history == "none":
+            pass  # A customer with nothing on file.
+        elif history == "refunded":
+            refund(charge_for(amount, "demo subscription payment"))
+        elif history == "prior":
+            # An older payment already refunded, and a fresh one to ask about.
+            refund(charge_for(amount, "demo subscription payment (earlier)"))
+            charge_for(amount, "demo subscription payment")
+        elif history == "multiple":
+            # Two candidates, so the policy refuses to guess which is meant.
+            charge_for(amount, "demo subscription payment (first)")
+            charge_for(amount, "demo subscription payment (second)")
+        else:
+            charge_for(amount, "demo subscription payment")
+
+    return {
+        "email": email,
+        "identifier": f"demo-{stamp}",
+        "name": "Demo Customer",
+        "history": history,
+        "amount_cents": str(amount),
+    }
 
 
 def page_settings() -> dict[str, str]:
@@ -166,8 +207,17 @@ class DemoHandler(SimpleHTTPRequestHandler):
             return
 
         try:
+            length = int(self.headers.get("Content-Length") or 0)
+            asked = json.loads(self.rfile.read(length) or "{}") if length else {}
             cleared = clear_queue(reset_demo.settings())
-            body = {"ok": True, "cleared": cleared, **new_customer()}
+            body = {
+                "ok": True,
+                "cleared": cleared,
+                **new_customer(
+                    amount_cents=int(asked.get("amount_cents") or 0),
+                    history=str(asked.get("history") or "clean"),
+                ),
+            }
         except Exception as error:  # the page should show what went wrong
             body = {"ok": False, "error": f"{type(error).__name__}: {error}"}
 

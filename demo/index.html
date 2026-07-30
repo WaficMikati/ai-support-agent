@@ -16,6 +16,15 @@
                    cursor: pointer; color: #444; }
     button.reset:hover { background: #f4f4f5; }
     #reset-note { font-size: .85rem; color: #777; margin-top: .6rem; min-height: 1.2em; }
+    fieldset.scenario { margin-top: 2rem; border: 1px solid #e4e4e7; border-radius: .5rem;
+                        padding: 1rem 1.25rem 1.25rem; }
+    fieldset.scenario legend { font-size: .85rem; color: #777; padding: 0 .4rem; }
+    fieldset.scenario label { display: block; font-size: .85rem; color: #555;
+                              margin-top: .6rem; margin-bottom: .2rem; }
+    fieldset.scenario select { width: 100%; padding: .4rem; font: inherit; font-size: .9rem;
+                               border: 1px solid #d4d4d8; border-radius: .4rem; background: #fff; }
+    .scenario-note { font-size: .8rem; color: #777; margin: .9rem 0 0; }
+    .scenario-note code { background: #f4f4f5; padding: .05rem .3rem; border-radius: .25rem; }
   </style>
 </head>
 <body>
@@ -27,6 +36,26 @@
   example <em>"can I skip a month?"</em>, <em>"do you have decaf?"</em> or
   <em>"my delivery hasn't arrived"</em>. Or ask for a refund: the visitor is a
   signed-in customer with a payment on file.</div>
+
+  <fieldset class="scenario">
+    <legend>Set up the customer</legend>
+    <label for="amount">Payment amount</label>
+    <select id="amount">
+      <option value="2000">$20.00 — inside the auto-approval limit</option>
+      <option value="9000">$90.00 — over the limit, needs a person</option>
+    </select>
+
+    <label for="history">Account history</label>
+    <select id="history">
+      <option value="clean">One payment, nothing refunded</option>
+      <option value="refunded">That payment is already refunded</option>
+      <option value="prior">An earlier payment was refunded before</option>
+      <option value="multiple">Two payments, neither refunded</option>
+      <option value="none">No payments at all</option>
+    </select>
+    <p class="scenario-note">Each of these trips a different check in
+    <code>refund_decision</code>. Only the first one refunds without a person.</p>
+  </fieldset>
 
   <button class="reset" id="reset">Start a fresh conversation</button>
   <p id="reset-note">A plain refresh resumes the same conversation, so use this
@@ -69,15 +98,44 @@
       } catch (e) { /* private mode; the reset still works for this session */ }
     }
 
+    // Put the selectors back where they were left. The reset reloads the page,
+    // and controls snapping back to their defaults while the note underneath
+    // describes something else is a confusing thing to have on a screen in
+    // front of a room.
+    (function () {
+      ["amount", "history"].forEach(function (id) {
+        var select = document.getElementById(id);
+        var saved = sessionStorage.getItem("demoChoice-" + id);
+        if (saved) select.value = saved;
+        select.addEventListener("change", function () {
+          sessionStorage.setItem("demoChoice-" + id, select.value);
+        });
+      });
+    })();
+
     (function () {
       var afterReset = sessionStorage.getItem("demoResetEmail");
       if (afterReset) {
         var cleared = sessionStorage.getItem("demoResetCleared") || "0";
+        var history = sessionStorage.getItem("demoResetHistory") || "clean";
+        var amount = sessionStorage.getItem("demoResetAmount") || "";
         sessionStorage.removeItem("demoResetEmail");
         sessionStorage.removeItem("demoResetCleared");
+        sessionStorage.removeItem("demoResetHistory");
+        sessionStorage.removeItem("demoResetAmount");
+        // Say what was actually set up, so what the agent does next can be
+        // checked against it rather than taken on trust.
+        var money = amount ? "$" + (parseInt(amount, 10) / 100).toFixed(2) : "a payment";
+        var SETUP = {
+          clean: "one payment of " + money + ", nothing refunded",
+          refunded: "one payment of " + money + ", already refunded",
+          prior: "a payment of " + money + ", after an earlier one was refunded",
+          multiple: "two payments of " + money + ", neither refunded",
+          none: "no payments at all",
+        };
         document.getElementById("reset-note").textContent =
           "Fresh conversation as " + afterReset +
-          ", with a refundable payment. " +
+          ", with " + (SETUP[history] || SETUP.clean) + ". " +
           (cleared === "0"
             ? "The queue was already empty."
             : "Cleared " + cleared + " conversation(s) from the queue.") +
@@ -109,7 +167,14 @@
       button.disabled = true;
       note.textContent = "Starting a fresh conversation…";
 
-      fetch("/reset", { method: "POST" })
+      fetch("/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          amount_cents: parseInt(document.getElementById("amount").value, 10),
+          history: document.getElementById("history").value,
+        }),
+      })
         .then(function (response) { return response.json(); })
         .then(function (body) {
           if (!body.ok) throw new Error(body.error || "reset failed");
@@ -131,6 +196,8 @@
           // above claims the identity for that one instead.
           sessionStorage.setItem("demoResetEmail", body.email);
           sessionStorage.setItem("demoResetCleared", String(body.cleared || 0));
+          sessionStorage.setItem("demoResetHistory", body.history || "clean");
+          sessionStorage.setItem("demoResetAmount", body.amount_cents || "");
           note.textContent = "Fresh conversation ready, reloading…";
           location.reload();
         })
