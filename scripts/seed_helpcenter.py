@@ -207,6 +207,21 @@ def settings() -> dict[str, str]:
 
 def main() -> int:
     config = settings()
+
+    # Say what is missing rather than raising KeyError from inside an f-string.
+    # This is the fourth step of the setup, so the likely reader is somebody who
+    # has not filled in .env yet, and a traceback does not tell them that.
+    missing = [
+        name
+        for name in ("CHATWOOT_URL", "CHATWOOT_ACCOUNT_ID", "CHATWOOT_TOKEN")
+        if not config.get(name)
+    ]
+    if missing:
+        print(f"missing from .env: {', '.join(missing)}")
+        print("Fill them in from what scripts/setup_chatwoot.py printed, or from")
+        print("deploy/admin.local.txt, which it wrote them to.")
+        return 1
+
     client = httpx.Client(
         base_url=f"{config['CHATWOOT_URL']}/api/v1/accounts/{config['CHATWOOT_ACCOUNT_ID']}",
         headers={"api_access_token": config["CHATWOOT_TOKEN"]},

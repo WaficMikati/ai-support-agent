@@ -93,6 +93,17 @@ cannot make it move.
 
 Everything else is created for you.
 
+It binds five ports on localhost: `3000` Chatwoot, `8080` the demo page, `5432`
+Postgres, and `3025` / `3143` for mail. Free them first if something else has
+them, since Docker's failure here is not always obvious.
+
+### 0. Get it
+
+```bash
+git clone git@github.com:WaficMikati/ai-support-agent.git
+cd ai-support-agent
+```
+
 ### 1. Start Chatwoot
 
 ```bash
@@ -133,7 +144,9 @@ docker compose run --rm rails bundle exec rails db:chatwoot_prepare
 docker compose up -d
 ```
 
-Chatwoot is now on <http://localhost:3000>.
+Chatwoot is then on <http://localhost:3000>, but not immediately: Rails takes a
+minute or so after the containers report as up. Wait for the page to actually
+load before the next step, which needs a running Rails to talk to.
 
 ### 2. Set up the account and inboxes
 
@@ -156,7 +169,13 @@ between them: agent auto-offline is turned off, or the widget tells every visito
 off, because it interrupts each new conversation before the agent has answered.
 
 Credentials are written to `deploy/admin.local.txt`, which is gitignored. The
-other scripts read it, so you rarely need to open it.
+other scripts read it, so mostly you can leave it alone.
+
+Open it for one thing: the email and password log you into
+<http://localhost:3000> as an agent. Worth doing before demonstrating any of
+this, because the dashboard is the other half of the story. Conversations appear
+there as they happen, the agent's replies arrive in them, and a held refund shows
+up as an open conversation with a private note explaining why a person is needed.
 
 ### 3. Configure the agent
 
