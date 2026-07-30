@@ -24,6 +24,7 @@ Stripe key stays in this process rather than being handed to the browser.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +38,33 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import reset_demo  # noqa: E402
 
 PORT = 8080
+
+
+def release_contact(config: dict[str, str], email: str) -> None:
+    """Delete this person's Chatwoot contact so the identity can be claimed again.
+
+    A reset clears the widget's cookie, so the browser returns as a brand new
+    contact and then tries to say who it is. Chatwoot allows one contact per
+    identifier and per email, and the old contact still holds both, so setUser
+    fails silently: the visitor stays anonymous, refunds stop matching, and
+    nothing anywhere says why.
+
+    This never came up while every reset invented a fresh address. It appears
+    the moment the address is one somebody typed and expects to keep.
+    """
+    if not email:
+        return
+    client = httpx.Client(
+        base_url=f"{config['CHATWOOT_URL']}/api/v1/accounts/{config['CHATWOOT_ACCOUNT_ID']}",
+        headers={"api_access_token": config["CHATWOOT_TOKEN"]},
+        timeout=20,
+    )
+    found = client.get("/contacts/search", params={"q": email})
+    if not found.is_success:
+        return
+    for contact in found.json().get("payload", []):
+        if (contact.get("email") or "").lower() == email.lower():
+            client.delete(f"/contacts/{contact['id']}")
 
 
 def clear_queue(config: dict[str, str], email: str | None = None) -> int:
@@ -89,6 +117,11 @@ def clear_queue(config: dict[str, str], email: str | None = None) -> int:
 # from today and "too old" cannot be reached with a real test charge.
 HISTORIES = ("clean", "refunded", "disputed", "prior", "multiple", "none")
 
+# Deliberately forgiving. This is checking that somebody typed an address
+# rather than their name into the wrong box, not policing what an address may
+# look like, and the strict-looking patterns reject real ones.
+EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 # Stripe's own test token for a charge the cardholder immediately disputes.
 # A real card number cannot be posted here: /v1/tokens answers 402 unless the
 # card was tokenised in a browser.
@@ -101,23 +134,25 @@ def new_customer(
     backdate_days: int = 0,
     amount_cents_2: int = 0,
     backdate_days_2: int = 0,
+    email: str = "",
+    name: str = "",
 ) -> dict[str, str]:
-    """Provision a brand new customer for a fresh conversation.
+    """Build the payment history for one person.
 
-    Deliberately not by deleting anything. Two constraints force this shape:
+    The address used to be invented here, one per reset. It is now whatever they
+    typed on the page, because being handed an identity you never gave is
+    exactly what made the agent look like it was reading minds.
 
-      * Chatwoot allows one contact per email per account, so a new visitor
-        cannot reuse the previous one's address
-      * deleting contacts leaves the browser holding a token that points at
-        something gone, and setUser against a stale token fails silently, so
-        the next visitor ends up anonymous and refunds stop matching
-
-    So each reset mints a unique address, gives it whatever payment history was
-    asked for, and the page identifies itself as that person.
+    Registering the same address twice replaces what was there rather than
+    adding to it. Stripe is happy to hold two customers with one email, and
+    since a refund is matched by email, a leftover from an earlier run would be
+    picked up as often as the new one. The old customer is deleted first, which
+    is why the scenario selectors can be changed and tried again.
     """
     config = reset_demo.settings()
     stamp = str(int(time.time()))
-    email = f"demo+{stamp}@example.com"
+    email = email.strip() or f"demo+{stamp}@example.com"
+    name = name.strip() or "Demo Customer"
     amount = amount_cents or reset_demo.DEMO_AMOUNT_CENTS
     if history not in HISTORIES:
         history = "clean"
@@ -129,9 +164,16 @@ def new_customer(
             headers={"Authorization": f"Bearer {setup_key}"},
             timeout=30,
         )
+        # Clear out anything registered under this address before, so the
+        # history is the one just chosen and not that plus the last attempt.
+        existing = client.get("/customers", params={"email": email, "limit": 100})
+        existing.raise_for_status()
+        for previous in existing.json().get("data", []):
+            client.delete(f"/customers/{previous['id']}")
+
         source = DISPUTE_SOURCE if history == "disputed" else "tok_visa"
         customer = client.post(
-            "/customers", data={"email": email, "source": source}
+            "/customers", data={"email": email, "name": name, "source": source}
         )
         customer.raise_for_status()
         customer_id = customer.json()["id"]
@@ -191,15 +233,18 @@ def new_customer(
 
     return {
         "email": email,
-        "identifier": f"demo-{stamp}",
-        "name": "Demo Customer",
+        # Chatwoot allows one contact per identifier, so this has to be the
+        # person rather than the visit: registering again must reach the same
+        # contact, not make a second one that cannot claim the address.
+        "identifier": email,
+        "name": name,
         "history": history,
         "amount_cents": str(amount),
         "backdate_days": str(backdate_days),
     }
 
 
-def page_settings() -> dict[str, str]:
+def page_settings(host: str = "") -> dict[str, str]:
     """The two values the page needs, from the same config as everything else.
 
     They used to be typed into the HTML. That is not a leak, since a widget
@@ -208,14 +253,24 @@ def page_settings() -> dict[str, str]:
     dead widget until they hand-edited the file.
     """
     config = reset_demo.settings()
-    # PUBLIC_CHATWOOT_URL when the page is being shared over a tunnel. The
-    # widget's script, its iframe and its websocket are all fetched by the
-    # visitor's browser, so localhost here means *their* machine and the chat
-    # bubble simply never appears. The agent goes on using CHATWOOT_URL, which
-    # is faster and does not stop working when a tunnel does.
+    # The widget's script, its iframe and its websocket are all fetched by the
+    # visitor's browser, so a page served over a tunnel cannot tell them
+    # Chatwoot is on localhost: that is their machine, and the bubble never
+    # appears. PUBLIC_CHATWOOT_URL is for them.
+    #
+    # Which is chosen by how this page was reached, not by whether the setting
+    # exists. Applying it to everybody meant a stale or stopped tunnel broke
+    # the demo on the very machine running it, with a name-resolution error in
+    # a console nobody had open. The agent is unaffected either way; it talks
+    # to CHATWOOT_URL directly.
+    local = host.split(":")[0] in ("localhost", "127.0.0.1", "[::1]", "")
     return {
-        "__CHATWOOT_URL__": config.get("PUBLIC_CHATWOOT_URL")
-        or config.get("CHATWOOT_URL", "http://localhost:3000"),
+        "__CHATWOOT_URL__": config.get("CHATWOOT_URL", "http://localhost:3000")
+        if local
+        else (
+            config.get("PUBLIC_CHATWOOT_URL")
+            or config.get("CHATWOOT_URL", "http://localhost:3000")
+        ),
         "__WIDGET_TOKEN__": config.get(
             "CHATWOOT_WIDGET_TOKEN", config.get("widget_token", "")
         ),
@@ -232,7 +287,7 @@ class DemoHandler(SimpleHTTPRequestHandler):
             return
 
         page = (ROOT / "demo" / "index.html").read_text()
-        values = page_settings()
+        values = page_settings(self.headers.get("Host", ""))
         if not values["__WIDGET_TOKEN__"]:
             # Say so on the page. A blank token gives a widget that silently
             # never appears, which is a miserable thing to debug.
@@ -259,7 +314,7 @@ class DemoHandler(SimpleHTTPRequestHandler):
         # conversation to close first, but it matters on a shared instance: a
         # first arrival must not clear anything, because everything open belongs
         # to somebody else.
-        if route not in ("/reset", "/visitor"):
+        if route not in ("/reset", "/register"):
             self.send_error(404)
             return
 
@@ -269,11 +324,24 @@ class DemoHandler(SimpleHTTPRequestHandler):
             # Only ever this visitor's own conversations, identified by the
             # address they were given last time. A first arrival has none.
             mine = str(asked.get("email") or "").strip()
-            cleared = (
-                clear_queue(reset_demo.settings(), email=mine)
-                if route == "/reset" and mine
-                else 0
+            wanted = str(asked.get("register_email") or "").strip()
+            if route == "/register" and not EMAIL.match(wanted):
+                raise ValueError(f"{wanted!r} does not look like an email address")
+            given = " ".join(
+                part for part in (
+                    str(asked.get("first_name") or "").strip(),
+                    str(asked.get("last_name") or "").strip(),
+                ) if part
             )
+            if route == "/register" and not given:
+                raise ValueError("a first and last name are needed")
+
+            cleared = 0
+            if route == "/reset" and mine:
+                cleared = clear_queue(reset_demo.settings(), email=mine)
+                # Then let go of the contact, so the browser coming back with a
+                # fresh cookie can be this person again rather than a stranger.
+                release_contact(reset_demo.settings(), mine)
             body = {
                 "ok": True,
                 "cleared": cleared,
@@ -283,6 +351,8 @@ class DemoHandler(SimpleHTTPRequestHandler):
                     backdate_days=int(asked.get("backdate_days") or 0),
                     amount_cents_2=int(asked.get("amount_cents_2") or 0),
                     backdate_days_2=int(asked.get("backdate_days_2") or 0),
+                    email=wanted or mine,
+                    name=given,
                 ),
             }
         except Exception as error:  # the page should show what went wrong

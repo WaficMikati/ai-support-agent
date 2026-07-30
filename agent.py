@@ -19,7 +19,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence
@@ -128,6 +128,11 @@ class Conversation:
     # happened to carry. Deciding whether to reply needs one message; writing
     # the reply needs all of them, and the two are fetched at different moments.
     history_complete: bool = False
+    # The contact's own custom attributes, which the conversation list already
+    # carries. The demo page writes this visitor's two choices there, so how a
+    # conversation behaves travels with the person rather than being a setting
+    # on the agent that everybody shares.
+    contact_attributes: Mapping[str, object] = field(default_factory=dict)
 
     def turns(self, limit: int = 10) -> tuple[Turn, ...]:
         """The conversation as the model should read it, oldest last-limit first.
@@ -627,6 +632,123 @@ class State:
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# Who a conversation is allowed to be about
+# --------------------------------------------------------------------------
+
+# Written by the demo page onto the contact, so one shared instance can have
+# every visitor set up differently rather than a single switch for the room.
+START_ATTRIBUTE = "demo_start"
+LOOKUP_ATTRIBUTE = "demo_lookup"
+
+# How the conversation begins.
+IDENTIFIED = "identified"  # we already know them, and say so
+ANONYMOUS = "anonymous"  # a stranger until they tell us who they are
+
+# What counts as telling us.
+GATED = "gated"  # only the address this browser registered with
+OPEN = "open"  # whatever address is typed, which is the interesting one
+
+EMAIL_PATTERN = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]*\w")
+
+
+def stated_email(conversation: Conversation) -> str | None:
+    """The last address the customer typed, if they have typed one.
+
+    Read from what they said rather than supplied by the model, which keeps the
+    tools argument-free in both lookup models. The model can decide it wants to
+    look something up; it never gets to choose whose account that is.
+    """
+    for turn in reversed(conversation.turns()):
+        if turn.role != "user":
+            continue
+        found = EMAIL_PATTERN.findall(turn.content)
+        if found:
+            return found[-1]
+    return None
+
+
+def identified_email(conversation: Conversation) -> str | None:
+    """Whose account this conversation may read, or None while nobody knows.
+
+    Identified conversations know from the start, the way a signed-in session
+    does. Anonymous ones begin as a stranger and stay that way until an address
+    is said out loud, which is the point: the agent cannot quietly know things
+    about somebody who has not introduced themselves.
+
+    Which addresses count is the second choice, and it is the one worth putting
+    on a screen:
+
+      gated  the address must be the one this browser registered with, so a
+             customer can identify themselves and nobody else
+      open   any address is accepted and looked up, which is what a first
+             implementation does and why support systems verify identity
+             instead of believing it
+
+    Neither hands the model an identifier. Both read it out of the conversation
+    in code. The difference is only whether it is checked against the person we
+    already had.
+    """
+    settings = conversation.contact_attributes or {}
+    if str(settings.get(START_ATTRIBUTE, IDENTIFIED)) != ANONYMOUS:
+        return conversation.contact_email
+
+    said = stated_email(conversation)
+    if not said:
+        return None
+    if str(settings.get(LOOKUP_ATTRIBUTE, GATED)) == OPEN:
+        return said
+
+    known = (conversation.contact_email or "").lower()
+    return said if known and said.lower() == known else None
+
+
+def first_reply(conversation: Conversation) -> bool:
+    """True while we have not said anything in this conversation yet."""
+    return not any(
+        not message.incoming
+        and not message.private
+        and not message.activity
+        and not message.template
+        for message in conversation.messages
+    )
+
+
+# Put in front of the first thing we say to somebody we were told about before
+# they said a word. Written in code rather than asked for in the guidance,
+# because the guidance was ignored often enough to be useless: the model
+# answered the question and never mentioned how it knew whose account to open.
+#
+# The request behind it was to send a message as the customer, saying hello and
+# their address, so that nothing looked hidden. Chatwoot refuses that on a
+# widget inbox, and putting words in somebody's mouth is a strange way to be
+# transparent in any case. Saying what we know, before using it, answers the
+# same objection: "how did it know about me?"
+IDENTITY_NOTICE = (
+    "Before we start: you are signed in as {email}, so I can already see your "
+    "account without asking."
+)
+
+
+def announced(reply: str, conversation: Conversation) -> str:
+    """The reply, prefaced by what we knew before they told us.
+
+    Only on the first reply, and only where the conversation was identified from
+    the start. Somebody who typed their address a moment ago does not need to be
+    told that we read it.
+    """
+    settings = conversation.contact_attributes or {}
+    # Only where the page actually chose this. Absent means a conversation that
+    # never went through registration, and prefacing those would be announcing
+    # an arrangement nobody made.
+    if str(settings.get(START_ATTRIBUTE, "")) != IDENTIFIED:
+        return reply
+    known = identified_email(conversation)
+    if not known or not first_reply(conversation):
+        return reply
+    return f"{IDENTITY_NOTICE.format(email=known)}\n\n{reply}"
+
+
 def describe_charge(charge: Charge | None) -> str:
     """A payment as a sentence, for the model to read.
 
@@ -669,7 +791,7 @@ def account_tools(state: State) -> dict[str, ToolFunction]:
     chat. If Chatwoot has no email for them there is nothing to look up, and
     offering the tool anyway would invite an answer built on a failed lookup.
     """
-    email = state.conversation.contact_email
+    email = identified_email(state.conversation)
     if not email:
         return {}
     return {"get_last_purchase": lambda: describe_charge(state.payments.latest_charge(email))}
@@ -705,7 +827,9 @@ def understand_node(state: State) -> State:
 def answer_node(state: State) -> State:
     """Send the reply the model wrote, and close the turn."""
     assert state.proposal is not None
-    state.inbox.send_reply(state.conversation.id, state.proposal.reply)
+    state.inbox.send_reply(
+        state.conversation.id, announced(state.proposal.reply, state.conversation)
+    )
     # Resolved rather than left open: Chatwoot reopens a conversation as soon as
     # the customer writes again, so nothing is lost and the inbox does not fill
     # up with conversations we have already dealt with.
@@ -721,11 +845,8 @@ def refund_node(state: State) -> State:
     and lets the edge do the routing, so the approval is a line you can point at.
     """
     assert state.proposal is not None
-    state.charge = (
-        state.payments.latest_charge(state.conversation.contact_email)
-        if state.conversation.contact_email
-        else None
-    )
+    known = identified_email(state.conversation)
+    state.charge = state.payments.latest_charge(known) if known else None
     state.decision = refund_decision(
         state.charge, state.proposal.confidence, now=state.now
     )
@@ -747,8 +868,11 @@ def execute_refund_node(state: State) -> State:
     # Written here rather than by the model, because it states an amount.
     state.inbox.send_reply(
         state.conversation.id,
-        f"That's refunded, {money(state.charge.amount_cents, state.charge.currency)} is on its way "
-        "back to your original payment method. It usually lands within a few days.",
+        announced(
+            f"That's refunded, {money(state.charge.amount_cents, state.charge.currency)} is on "
+            "its way back to your original payment method. It usually lands within a few days.",
+            state.conversation,
+        ),
     )
     # The same record a refusal leaves, for the case where money actually moved.
     state.inbox.add_private_note(
@@ -773,7 +897,7 @@ def hold_node(state: State) -> State:
     # coming back when a human has not agreed to it.
     state.inbox.send_reply(
         state.conversation.id,
-        held_reply(state.proposal.reply, state.decision.code),
+        announced(held_reply(state.proposal.reply, state.decision.code), state.conversation),
     )
     # Deliberately left open, and not resolved: a person still has to act.
     state.inbox.add_private_note(
@@ -1000,6 +1124,7 @@ class ChatwootInbox:
         return Conversation(
             id=conversation_id,
             contact_email=contact.get("email"),
+            contact_attributes=contact.get("custom_attributes") or {},
             messages=messages,
             handled_message_id=int(handled) if str(handled).isdigit() else None,
             # The fallback fetched everything, so in that case it is already whole.

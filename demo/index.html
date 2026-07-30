@@ -23,7 +23,8 @@
                               margin-bottom: .2rem; }
     fieldset.scenario .field { margin-top: .6rem; }
     fieldset.scenario .field[hidden] { display: none; }
-    fieldset.scenario select { width: 100%; padding: .4rem; font: inherit; font-size: .9rem;
+    fieldset.scenario select,
+    fieldset.scenario input { width: 100%; padding: .4rem; font: inherit; font-size: .9rem;
                                border: 1px solid #d4d4d8; border-radius: .4rem; background: #fff; }
     .scenario-note { font-size: .8rem; color: #777; margin: .9rem 0 0; }
     .scenario-note code { background: #f4f4f5; padding: .05rem .3rem; border-radius: .25rem; }
@@ -38,6 +39,45 @@
   example <em>"can I skip a month?"</em>, <em>"do you have decaf?"</em> or
   <em>"my delivery hasn't arrived"</em>. Or ask for a refund: the visitor is a
   signed-in customer with a payment on file.</div>
+
+  <fieldset class="scenario" id="registration">
+    <legend>Register</legend>
+    <p class="scenario-note" style="margin-top:0">Your details go into the shop's
+    records, along with the payment history below. The chat is separate: what it
+    is allowed to know about you is the next choice down.</p>
+
+    <div class="field">
+      <label for="first-name">First name</label>
+      <input id="first-name" type="text" autocomplete="given-name">
+    </div>
+
+    <div class="field">
+      <label for="last-name">Last name</label>
+      <input id="last-name" type="text" autocomplete="family-name">
+    </div>
+
+    <div class="field">
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="email"
+             placeholder="you@example.com">
+    </div>
+
+    <div class="field">
+      <label for="start">How the chat starts</label>
+      <select id="start">
+        <option value="anonymous">Anonymous — the agent has to ask who you are</option>
+        <option value="identified">Identified — the agent is told, and says so</option>
+      </select>
+    </div>
+
+    <div class="field" id="field-lookup">
+      <label for="lookup">Which address it will accept</label>
+      <select id="lookup">
+        <option value="gated">Only yours — anyone else's is refused</option>
+        <option value="open">Any address it is given — looked up as typed</option>
+      </select>
+    </div>
+  </fieldset>
 
   <fieldset class="scenario">
     <legend>Set up the customer</legend>
@@ -88,9 +128,9 @@
     <p class="scenario-note" id="expected"></p>
   </fieldset>
 
-  <button class="reset" id="reset">Start a fresh conversation</button>
-  <p id="reset-note">A plain refresh resumes the same conversation, so use this
-  between demo runs.</p>
+  <button class="reset" id="reset">Register and start chatting</button>
+  <p id="reset-note">Nothing exists until you register. Press this again at any
+  point to rebuild your history and start a fresh conversation.</p>
 
   <script>
     (function (d, t) {
@@ -104,23 +144,15 @@
       };
     })(document, "script");
 
-    // There is deliberately no default visitor. There used to be one, and it
-    // was fine while one person ran this on their own machine: every browser
-    // announced itself as "demo-visitor", and there was only ever one browser.
-    // Shared over a tunnel that collapses a room into one person. Chatwoot
-    // allows a single contact per identifier, so every attendee merged into the
-    // same contact and watched each other type, and since refunds match on the
-    // contact's email they were all competing for one Stripe charge.
+    // Nobody is anybody until they register. There used to be a default
+    // visitor, and before that a randomly minted one, and both had the same
+    // problem from the far side of the screen: the agent knew an address the
+    // person had never given it. Being handed an identity you did not choose is
+    // what makes a demo look like a trick.
     //
-    // So somebody who has never been here is given their own identity, customer
-    // and payment before the widget is told who they are. That is the work the
-    // reset button already did, now happening on first arrival too.
+    // So the details are typed, and what the chat is allowed to do with them is
+    // a separate, visible choice.
 
-    // Who this browser is currently pretending to be. Kept in localStorage so
-    // it survives the reload a reset performs. Without this the reset rotated
-    // the identity, reloaded, and the ready handler below immediately put the
-    // original customer back, so the same conversation reappeared and the reset
-    // looked like it had done nothing.
     function currentVisitor() {
       try {
         return JSON.parse(localStorage.getItem("demoVisitor")) || null;
@@ -132,41 +164,52 @@
     function rememberVisitor(visitor) {
       try {
         localStorage.setItem("demoVisitor", JSON.stringify(visitor));
-      } catch (e) { /* private mode; the reset still works for this session */ }
+      } catch (e) { /* private mode; it still works for this session */ }
     }
 
-    function scenario() {
+    function value(id) {
+      return (document.getElementById(id).value || "").trim();
+    }
+
+    // Everything the server needs to build this person and their history.
+    function registration() {
       return {
+        register_email: value("email"),
+        first_name: value("first-name"),
+        last_name: value("last-name"),
+        email: (currentVisitor() || {}).email || "",
+        history: value("history"),
         amount_cents: document.getElementById("field-amount").hidden
           ? 2000
-          : parseInt(document.getElementById("amount").value, 10),
+          : parseInt(value("amount"), 10),
         backdate_days: document.getElementById("field-age").hidden
           ? 0
-          : parseInt(document.getElementById("age").value, 10),
+          : parseInt(value("age"), 10),
         amount_cents_2: document.getElementById("field-amount2").hidden
           ? 0
-          : parseInt(document.getElementById("amount2").value, 10),
+          : parseInt(value("amount2"), 10),
         backdate_days_2: document.getElementById("field-age2").hidden
           ? 0
-          : parseInt(document.getElementById("age2").value, 10),
-        history: document.getElementById("history").value,
+          : parseInt(value("age2"), 10),
       };
     }
 
-
-    // Put the selectors back where they were left. The reset reloads the page,
-    // and controls snapping back to their defaults while the note underneath
-    // describes something else is a confusing thing to have on a screen in
-    // front of a room.
+    // Remember every control, so a reload does not throw away what was typed.
+    // The reset reloads the page, and a form emptying itself underneath a note
+    // describing what was just built is a confusing thing to put on a screen.
+    var REMEMBERED = ["first-name", "last-name", "email", "start", "lookup",
+                      "history", "amount", "age", "amount2", "age2"];
     (function () {
-      ["history", "amount", "age", "amount2", "age2"].forEach(function (id) {
-        var select = document.getElementById(id);
+      REMEMBERED.forEach(function (id) {
+        var control = document.getElementById(id);
         var saved = sessionStorage.getItem("demoChoice-" + id);
-        if (saved) select.value = saved;
-        select.addEventListener("change", function () {
-          sessionStorage.setItem("demoChoice-" + id, select.value);
+        if (saved) control.value = saved;
+        control.addEventListener("change", function () {
+          sessionStorage.setItem("demoChoice-" + id, control.value);
           refreshFields();
-
+        });
+        control.addEventListener("input", function () {
+          sessionStorage.setItem("demoChoice-" + id, control.value);
         });
       });
     })();
@@ -175,8 +218,7 @@
     // them to. They stay for every other history, because they are not only
     // refund inputs: the agent can look a payment up and talk about it, and
     // "your payment of $90.00 on that date has already been refunded" is a real
-    // thing to demonstrate. Judging them by whether they change the refund
-    // outcome alone was too narrow.
+    // thing to demonstrate.
     //
     // What they must not do is quietly contradict the label. refund_decision
     // stops at the first check that fails, so a $90.00 payment with an earlier
@@ -195,9 +237,9 @@
     }
 
     function refreshFields() {
-      var history = document.getElementById("history").value;
-      var amountCents = parseInt(document.getElementById("amount").value, 10);
-      var ageDays = parseInt(document.getElementById("age").value, 10);
+      var history = value("history");
+      var amountCents = parseInt(value("amount"), 10);
+      var ageDays = parseInt(value("age"), 10);
 
       var hasPayment = history !== "none";
       // Two payments means two of everything. Giving them the same amount and
@@ -210,6 +252,11 @@
       document.getElementById("field-age").hidden = !hasPayment;
       document.getElementById("field-amount2").hidden = !twoPayments;
       document.getElementById("field-age2").hidden = !twoPayments;
+
+      // Which addresses are accepted only means something while the agent is
+      // still waiting to be told one. An identified chat was told at the start.
+      document.getElementById("field-lookup").hidden =
+        value("start") !== "anonymous";
 
       document.getElementById("label-amount").textContent =
         twoPayments ? "First payment amount" : "Payment amount";
@@ -227,33 +274,6 @@
 
     refreshFields();
 
-    // Resolves to whoever this browser is, provisioning one on a first visit.
-    // Held as a promise because the widget becomes ready on its own schedule
-    // and must not be told who the visitor is before there is an answer.
-    var visitorReady = (function () {
-      var known = currentVisitor();
-      if (known) return Promise.resolve(known);
-
-      var asked = scenario();
-      asked.email = "";  // nothing of ours is open yet, so nothing to close
-      return fetch("/visitor", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(asked),
-      })
-        .then(function (response) { return response.json(); })
-        .then(function (body) {
-          if (!body.ok) throw new Error(body.error || "could not set you up");
-          var visitor = {
-            identifier: body.identifier,
-            email: body.email,
-            name: body.name,
-          };
-          rememberVisitor(visitor);
-          return visitor;
-        });
-    })();
-
     (function () {
       var afterReset = sessionStorage.getItem("demoResetEmail");
       if (afterReset) {
@@ -261,11 +281,9 @@
         var history = sessionStorage.getItem("demoResetHistory") || "clean";
         var amount = sessionStorage.getItem("demoResetAmount") || "";
         var days = parseInt(sessionStorage.getItem("demoResetAge") || "0", 10);
-        sessionStorage.removeItem("demoResetEmail");
-        sessionStorage.removeItem("demoResetCleared");
-        sessionStorage.removeItem("demoResetHistory");
-        sessionStorage.removeItem("demoResetAmount");
-        sessionStorage.removeItem("demoResetAge");
+        ["Email", "Cleared", "History", "Amount", "Age"].forEach(function (k) {
+          sessionStorage.removeItem("demoReset" + k);
+        });
         // Say what was actually set up, so what the agent does next can be
         // checked against it rather than taken on trust.
         var money = amount ? "$" + (parseInt(amount, 10) / 100).toFixed(2) : "a payment";
@@ -278,76 +296,86 @@
           multiple: "two payments of " + money + when + ", neither refunded",
           none: "no payments at all",
         };
+        var startedAs = sessionStorage.getItem("demoChoice-start") === "identified"
+          ? "The agent has been told who you are."
+          : "The agent has not been told who you are, so it will ask.";
         document.getElementById("reset-note").textContent =
-          "Fresh conversation as " + afterReset +
-          ", with " + (SETUP[history] || SETUP.clean) + ". " +
-          (cleared === "0"
-            ? "The queue was already empty."
-            : "Cleared " + cleared + " conversation(s) from the queue.") +
-          " Open the chat bubble.";
+          "Registered as " + afterReset + ", with " +
+          (SETUP[history] || SETUP.clean) + ". " +
+          (cleared === "0" ? "" : "Closed " + cleared + " earlier conversation(s). ") +
+          startedAs + " Open the chat bubble.";
       }
     })();
 
-    // Tell the widget who the visitor is, the way a real site would for a
-    // signed-in customer. Two reasons this matters rather than leaving them
-    // anonymous: Chatwoot stops interrupting the conversation to ask for an
-    // email, and the refund path has an address to match against Stripe. An
-    // anonymous visitor can never be matched to a charge.
-    window.addEventListener("chatwoot:ready", function () {
-      // Wait for the identity rather than reaching for one. On a first visit
-      // this is still in flight, and announcing a shared fallback in the
-      // meantime is exactly the bug this replaced.
-      visitorReady
-        .then(function (visitor) {
-          window.$chatwoot.setUser(visitor.identifier, {
-            email: visitor.email,
-            name: visitor.name,
-          });
-        })
-        .catch(function (error) {
-          document.getElementById("reset-note").textContent =
-            "Could not set you up: " + error.message +
-            ". Refunds will not match a payment until this works.";
-        });
-    });
+    // Tell the widget who the visitor is, but only once they have said so, and
+    // only when the chat is meant to start knowing. An anonymous chat stays a
+    // stranger until an address is typed into it, which is the whole point of
+    // the choice: the agent cannot know something it was never told.
+    // Told once the widget is ready, and again immediately if it already was.
+    // The event fires on the SDK's own schedule and can be gone before this
+    // listener exists, which leaves the visitor anonymous with no error
+    // anywhere: the page looks fine, the contact simply never gets a name.
+    function announce() {
+      var visitor = currentVisitor();
+      if (!visitor || !window.$chatwoot) return;
 
-    // A fresh conversation means a fresh customer. $chatwoot.reset() does not
-    // clear the visitor, the cookie is out of reach because the chat is an
-    // iframe on its own origin, and deleting contacts server-side leaves this
-    // page holding a dead token. What works is asking the server for a new
-    // customer, complete with a refundable charge, and identifying as them.
+      // How this conversation should behave, carried on the contact so one
+      // shared instance can have every visitor set up differently.
+      window.$chatwoot.setCustomAttributes({
+        demo_start: visitor.start,
+        demo_lookup: visitor.lookup,
+      });
+
+      // The contact is always the person who registered, whichever mode is on.
+      // What changes is what the agent may do with it, and that is decided by
+      // the attributes above rather than by hiding the record.
+      //
+      // Hiding it was the first attempt and it does not work. The gated model
+      // compares the address somebody types against the one they registered
+      // with, and an anonymous contact has nothing to compare against, so every
+      // address was refused including their own. Chatwoot also needs the contact
+      // to keep visitors apart and to scope a reset to its owner.
+      window.$chatwoot.setUser(visitor.identifier, {
+        email: visitor.email,
+        name: visitor.name,
+      });
+    }
+
+    window.addEventListener("chatwoot:ready", announce);
+    announce();
+
     document.getElementById("reset").addEventListener("click", function () {
       var note = document.getElementById("reset-note");
       var button = document.getElementById("reset");
-      button.disabled = true;
-      note.textContent = "Starting a fresh conversation…";
+      var asked = registration();
 
-      fetch("/reset", {
+      if (!asked.first_name || !asked.last_name || !asked.register_email) {
+        note.textContent = "Your first name, last name and email are all needed.";
+        return;
+      }
+
+      button.disabled = true;
+      note.textContent = "Setting you up…";
+
+      // /register builds the person; /reset also closes what they had open.
+      // A visitor who has been here before is starting again, not arriving.
+      var route = currentVisitor() ? "/reset" : "/register";
+      fetch(route, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // A hidden control sends its default, not whatever it was last set to.
-        // Otherwise a $90.00 chosen earlier is still in the box while the box
-        // is out of sight, and the account gets built to something other than
-        // what the page is showing.
-        //
-        // The email says which conversations may be closed: this visitor's own
-        // and nobody else's. Without it a reset on a shared instance ends
-        // strangers' conversations.
-        body: JSON.stringify(
-          Object.assign(scenario(), {
-            email: (currentVisitor() || {}).email || "",
-          })
-        ),
+        body: JSON.stringify(asked),
       })
         .then(function (response) { return response.json(); })
         .then(function (body) {
-          if (!body.ok) throw new Error(body.error || "reset failed");
+          if (!body.ok) throw new Error(body.error || "could not set you up");
           // Remember before reloading, so the ready handler identifies as the
           // new customer rather than putting the old one back.
           rememberVisitor({
             identifier: body.identifier,
             email: body.email,
             name: body.name,
+            start: value("start"),
+            lookup: value("lookup"),
           });
           // Deliberately NOT calling setUser here. Doing so attaches the new
           // identity to the contact we are about to abandon, and Chatwoot allows
@@ -363,13 +391,13 @@
           sessionStorage.setItem("demoResetHistory", body.history || "clean");
           sessionStorage.setItem("demoResetAge", body.backdate_days || "0");
           sessionStorage.setItem("demoResetAmount", body.amount_cents || "");
-          note.textContent = "Fresh conversation ready, reloading…";
+          note.textContent = "Ready, reloading…";
           location.reload();
         })
         .catch(function (error) {
           button.disabled = false;
           note.textContent =
-            "Reset failed: " + error.message +
+            "Could not set you up: " + error.message +
             ". Is the page served by demo/serve.py?";
         });
     });
