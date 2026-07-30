@@ -17,6 +17,13 @@ INCOMING = {"id": 1, "content": "I want a refund", "message_type": 0, "private":
 OUTGOING = {"id": 2, "content": "on it", "message_type": 1, "private": False}
 PRIVATE_NOTE = {"id": 3, "content": "held for review", "message_type": 1, "private": True}
 ACTIVITY = {"id": 4, "content": "Label added", "message_type": 2, "private": False}
+# What the widget appends after a visitor's first message, asking for an email.
+TEMPLATE = {
+    "id": 5,
+    "content": "Give the team a way to reach you.",
+    "message_type": 3,
+    "private": False,
+}
 
 CONVERSATION_ENTRY = {
     "id": 7,
@@ -96,6 +103,25 @@ def test_an_activity_entry_does_not_mute_the_conversation():
     look like a reply."""
     conversation = only_conversation([INCOMING, ACTIVITY])
     assert needs_reply(conversation)
+
+
+def test_a_widget_template_prompt_does_not_mute_the_conversation():
+    """The real widget appends "give the team a way to reach you" as a template
+    message straight after a visitor's first message. Counting that as our turn
+    meant no widget visitor was ever answered."""
+    conversation = only_conversation([INCOMING, TEMPLATE])
+    assert needs_reply(conversation)
+
+
+def test_templates_are_marked_as_templates():
+    messages = only_conversation([INCOMING, TEMPLATE]).messages
+    assert messages[-1].template
+    assert not messages[-1].activity
+
+
+def test_a_real_reply_after_a_template_still_closes_the_turn():
+    conversation = only_conversation([INCOMING, TEMPLATE, OUTGOING])
+    assert not needs_reply(conversation)
 
 
 def test_customer_writing_again_after_a_note_reopens_it():

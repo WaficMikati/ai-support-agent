@@ -75,7 +75,12 @@ class Message:
     content: str
     incoming: bool
     private: bool = False
+    # Chatwoot files things other than conversation turns as messages: status
+    # changes and label edits as `activity`, and its own prompts to the visitor
+    # (such as asking for an email address) as `template`. Neither is somebody
+    # speaking.
     activity: bool = False
+    template: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,12 +93,18 @@ class Conversation:
     def latest(self) -> Message | None:
         """The newest message that represents somebody speaking.
 
-        Chatwoot also files status changes, assignments and labels as
-        messages. Those are nobody's turn, so they are skipped: otherwise a
-        label being added after a customer writes in would look like a reply
-        and the conversation would never be answered.
+        Only the customer and us count. Chatwoot's own entries are skipped, and
+        both kinds matter in practice: a label added after a customer writes in
+        would otherwise look like a reply, and the widget appends its
+        "give the team a way to reach you" prompt as a template message
+        immediately after a visitor's first message, which silenced every
+        widget conversation until this excluded it.
         """
-        spoken = [message for message in self.messages if not message.activity]
+        spoken = [
+            message
+            for message in self.messages
+            if not message.activity and not message.template
+        ]
         return spoken[-1] if spoken else None
 
 
@@ -457,6 +468,7 @@ class ChatwootInbox:
                 incoming=item.get("message_type") == 0,
                 private=bool(item.get("private")),
                 activity=item.get("message_type") == 2,
+                template=item.get("message_type") == 3,
             )
             for item in response.json()["payload"]
         )

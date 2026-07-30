@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>4Geeks — Support demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1.5rem;
+           color: #1c1c1c; line-height: 1.6; }
+    h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+    p.lede { color: #555; margin-top: 0; }
+    .hint { margin-top: 3rem; padding: 1rem 1.25rem; background: #f4f4f5; border-radius: .5rem;
+            font-size: .95rem; color: #444; }
+  </style>
+</head>
+<body>
+  <h1>4Geeks Bootcamps</h1>
+  <p class="lede">Learn to build software. Ask us anything.</p>
+  <p>Our support agent answers common questions straight away. Anything it is
+  not sure about goes to a person.</p>
+  <div class="hint">Open the chat bubble in the corner and ask something, for
+  example <em>"I can't log in and the reset email never arrives"</em>.</div>
+
+  <script>
+    (function (d, t) {
+      var BASE_URL = "http://localhost:3000";
+      var g = d.createElement(t), s = d.getElementsByTagName(t)[0];
+      g.src = BASE_URL + "/packs/js/sdk.js";
+      g.defer = true; g.async = true;
+      s.parentNode.insertBefore(g, s);
+      g.onload = function () {
+        window.chatwootSDK.run({ websiteToken: "RhFSY9waaN1NfZMe3ZmidenE", baseUrl: BASE_URL });
+      };
+    })(document, "script");
+  </script>
+</body>
+</html>

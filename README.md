@@ -163,7 +163,7 @@ uv run python agent.py
 ## Tests
 
 ```bash
-uv run pytest                          # 99 tests, no network, no credentials
+uv run pytest                          # 102 tests, no network, no credentials
 uv run python scripts/live_check.py    # the inbox adapter against live Chatwoot
 uv run python scripts/e2e_check.py     # everything live: OpenRouter, Stripe, Chatwoot
 uv run python scripts/reload_check.py  # editing knowledge.md with the agent running
