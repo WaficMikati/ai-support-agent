@@ -64,8 +64,12 @@ Two separate inputs, which is what lets the documentation change without
 touching the instructions:
 
 - **`knowledge.md` is how to behave.** Tone, when to ask a follow-up rather
-  than hand over, and the standing rule never to invent. It is re-read on every
-  poll, so editing it changes behaviour within one interval, no restart.
+  than hand over, and the standing rule never to invent. It states no facts at
+  all: no prices, no policies, not even where a setting lives. It used to, and
+  that was a bug rather than duplication, because it said cancellation was under
+  Billing while the documentation said Subscription, leaving the agent two
+  contradictory answers to pick from. It is re-read on every poll, so editing it
+  changes behaviour within one interval, no restart.
 - **The help centre is what may be stated as fact.** Articles are fetched from
   a Chatwoot portal, cached for five minutes, and the few relevant to the
   question go into the prompt. If nothing matches, the agent is told to answer
@@ -89,6 +93,13 @@ size; a corpus too large to fetch is where embeddings start to earn their keep.
 subscription, so the workshop has documentation to answer from that cannot be
 mistaken for anyone's real policy. Point `HELP_CENTRE_PORTAL` at a different
 portal to use real documentation instead; no code changes.
+
+**Keep the inbox tidy, it is a latency issue.** Each poll fetches the messages
+of every open conversation, so a cluttered inbox costs a round trip per
+conversation before the agent even reaches the new message. Measured on this
+setup: with eight stale open conversations a reply took 3.6 to 4.6 seconds, and
+with none it took 1.5 to 2.5 seconds, for about one second of actual model work.
+`scripts/reset_demo.py` before a demo is a speed fix, not just tidying.
 
 **Temperature is pinned to 0.** Both jobs want the most likely answer rather
 than a creative one, and this is not cosmetic: left at the provider default,
