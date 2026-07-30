@@ -1,12 +1,12 @@
 # AI support agent
 
 Reads a Chatwoot inbox, classifies each incoming message, and either answers
-it from `knowledge.md` or issues a Stripe refund.
+it from a help centre or issues a Stripe refund.
 
 Built for a two-part workshop:
 
-- **Session 1** — widget, polling, classification, answering from the
-  knowledge file. Ends with a working responder that cannot act on anything.
+- **Session 1** — widget, polling, classification, answering from documentation.
+  Ends with a working responder that cannot act on anything.
 - **Session 2** — the refund path, the approval rules, scoped credentials.
 
 Demo only. The agent refuses to start against a live Stripe key.
@@ -29,7 +29,7 @@ classify → {intent, confidence}          OpenRouter, strict JSON schema
       │               ├── passes → Stripe refund + reply + resolve
       │               └── fails  → private note, left open for a human
       │
-      └── support → answer from knowledge.md → reply + resolve
+      └── support → help centre articles + knowledge.md → reply + resolve
 ```
 
 Only the newest message decides whether we act: if we spoke last, the
@@ -58,8 +58,37 @@ acting on the same message twice:
 Answered and refunded conversations are resolved. Chatwoot reopens one as
 soon as the customer writes again, so nothing is lost.
 
-`knowledge.md` is re-read on every poll. Editing it changes the answers
-within one interval, with no restart.
+## Where answers come from
+
+Two separate inputs, which is what lets the documentation change without
+touching the instructions:
+
+- **`knowledge.md` is how to behave.** Tone, when to ask a follow-up rather
+  than hand over, and the standing rule never to invent. It is re-read on every
+  poll, so editing it changes behaviour within one interval, no restart.
+- **The help centre is what may be stated as fact.** Articles are fetched from
+  a Chatwoot portal, cached for five minutes, and the few relevant to the
+  question go into the prompt. If nothing matches, the agent is told to answer
+  generally and to state nothing specific about the product.
+
+That split is the point. The model already knows how to write a support reply;
+what it cannot know is your prices and policies. So it brings the language and
+the help centre brings the facts. Ask it something general and it answers.
+Ask it something about the product with no matching article and it declines
+rather than inventing.
+
+Selection is word overlap against the fetched articles, with a title match
+weighted above a body match, and words matching on a shared prefix so "cancel"
+finds "Cancelling your subscription". Chatwoot's own `?query=` is a phrase
+match and is not usable for this: it returns nothing for "How do I cancel my
+subscription?" despite that article existing. Fetching a few dozen short
+articles and scoring them locally is the right amount of machinery at this
+size; a corpus too large to fetch is where embeddings start to earn their keep.
+
+`scripts/seed_helpcenter.py` creates a mock help centre for a fictional coffee
+subscription, so the workshop has documentation to answer from that cannot be
+mistaken for anyone's real policy. Point `HELP_CENTRE_PORTAL` at a different
+portal to use real documentation instead; no code changes.
 
 **Temperature is pinned to 0.** Both jobs want the most likely answer rather
 than a creative one, and this is not cosmetic: left at the provider default,

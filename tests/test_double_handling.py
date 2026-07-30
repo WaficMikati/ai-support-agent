@@ -98,7 +98,7 @@ def act(conv, handled, *, inbox=None, payments=None, intent="support", brain=Non
         inbox=inbox,
         payments=payments,
         classify=brain or (lambda message: Classification(intent, 0.99)),
-        answer=lambda message, knowledge: "answer",
+        answer=lambda message, knowledge, articles=(): "answer",
         knowledge="guidance",
         handled=handled,
         now=NOW,
@@ -192,7 +192,7 @@ def test_the_loop_shares_one_set_across_passes():
         inbox=inbox,
         payments=FakePayments(charge()),
         classify=lambda message: Classification("support", 0.99),
-        answer=lambda message, knowledge: "answer",
+        answer=lambda message, knowledge, articles=(): "answer",
         knowledge="guidance",
         handled=handled,
     )

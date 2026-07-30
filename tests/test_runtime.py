@@ -73,7 +73,7 @@ def run_passes(knowledge_file, passes: int, inbox) -> None:
             inbox=inbox,
             payments=None,
             classify=lambda message: Classification("support", 0.99),
-            answer=lambda message, knowledge: knowledge.strip(),
+            answer=lambda message, knowledge, articles=(): knowledge.strip(),
             interval_seconds=0,
         )
 
@@ -102,7 +102,7 @@ def test_editing_the_knowledge_file_takes_effect_without_a_restart(tmp_path):
             inbox=inbox,
             payments=None,
             classify=lambda message: Classification("support", 0.99),
-            answer=lambda message, knowledge_text: knowledge_text.strip(),
+            answer=lambda message, knowledge_text, articles=(): knowledge_text.strip(),
             interval_seconds=0,
         )
 

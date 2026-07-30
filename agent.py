@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Sequence
 
 import httpx
 
@@ -122,6 +122,14 @@ class Conversation:
 
 
 @dataclass(frozen=True)
+class Article:
+    """One help centre article: a fact the agent is allowed to state."""
+
+    title: str
+    content: str
+
+
+@dataclass(frozen=True)
 class Charge:
     id: str
     amount_cents: int
@@ -168,7 +176,13 @@ class Classifier(Protocol):
 
 
 class Answerer(Protocol):
-    def __call__(self, message: str, knowledge: str) -> str: ...
+    def __call__(
+        self, message: str, knowledge: str, articles: Sequence[Article]
+    ) -> str: ...
+
+
+class HelpCentre(Protocol):
+    def relevant(self, question: str, limit: int = 3) -> list[Article]: ...
 
 
 # --------------------------------------------------------------------------
@@ -299,6 +313,7 @@ def handle_conversation(
     classify: Classifier,
     answer: Answerer,
     knowledge: str,
+    help_centre: HelpCentre | None = None,
     handled: HandledMessages | None = None,
     now: datetime | None = None,
 ) -> str:
@@ -328,7 +343,14 @@ def handle_conversation(
             now=now,
         )
     else:
-        reply = answer(latest.content, knowledge)
+        articles = help_centre.relevant(latest.content) if help_centre else []
+        if articles:
+            log.info(
+                "conversation %s answered from %s",
+                conversation.id,
+                ", ".join(article.title for article in articles),
+            )
+        reply = answer(latest.content, knowledge, articles)
         inbox.send_reply(conversation.id, reply)
         # Resolved rather than left open: Chatwoot reopens a conversation as
         # soon as the customer writes again, so nothing is lost and the inbox
@@ -399,6 +421,7 @@ def run_once(
     classify: Classifier,
     answer: Answerer,
     knowledge: str,
+    help_centre: HelpCentre | None = None,
     handled: HandledMessages | None = None,
 ) -> list[str]:
     actions = []
@@ -413,6 +436,7 @@ def run_once(
                 classify=classify,
                 answer=answer,
                 knowledge=knowledge,
+                help_centre=help_centre,
                 handled=handled,
             )
         )
@@ -515,6 +539,124 @@ class ChatwootInbox:
             },
         )
         response.raise_for_status()
+
+
+# --------------------------------------------------------------------------
+# The help centre, as the source of facts
+# --------------------------------------------------------------------------
+
+# Words too common to say anything about which article is relevant.
+STOPWORDS = frozenset(
+    """a about after all also am an and any are as at be been but by can cannot
+    could did do does doing for from get got had has have how i if in into is it
+    its just me my no not of on or our out over please so some than that the
+    their them then there these they this to too up us was we were what when
+    where which who why will with would you your""".split()
+)
+
+
+def keywords(text: str) -> set[str]:
+    """The words in a question worth matching on."""
+    cleaned = "".join(c.lower() if c.isalnum() else " " for c in text)
+    return {word for word in cleaned.split() if len(word) > 2 and word not in STOPWORDS}
+
+
+def overlap(wanted: set[str], text: str) -> int:
+    """How many of the wanted words appear in this text.
+
+    Words count as the same when one is a prefix of the other, from four
+    characters. Exact matching would miss the obvious: someone asking to
+    "cancel" would not find "Cancelling your subscription" or the word
+    "cancellation" in its body. This is a blunt instrument compared with proper
+    stemming, and it is the right amount of machinery for a few dozen articles.
+    """
+    present = keywords(text)
+    hits = 0
+    for want in wanted:
+        if want in present:
+            hits += 1
+            continue
+        if len(want) >= 4 and any(
+            word.startswith(want) or (len(word) >= 4 and want.startswith(word))
+            for word in present
+        ):
+            hits += 1
+    return hits
+
+
+class ChatwootHelpCentre:
+    """Finds the articles relevant to a question.
+
+    Chatwoot's own `?query=` is a phrase match rather than a search: asking it
+    for "How do I cancel my subscription?" returns nothing even though an
+    article called "Cancelling your subscription" exists. So the articles are
+    fetched once, cached, and scored here on word overlap, with a title match
+    counting for more than a body match.
+
+    That is the right shape at this size. A corpus too large to fetch is where
+    embeddings and a vector store start to earn their keep.
+    """
+
+    TITLE_WEIGHT = 3
+
+    def __init__(
+        self,
+        base_url: str,
+        account_id: str,
+        token: str,
+        portal_slug: str,
+        ttl_seconds: int = 300,
+        transport: httpx.BaseTransport | None = None,
+        now=time.monotonic,
+    ):
+        self._portal = portal_slug
+        self._ttl = ttl_seconds
+        self._now = now
+        self._cached: list[Article] = []
+        self._fetched_at: float | None = None
+        self._client = httpx.Client(
+            base_url=f"{base_url.rstrip('/')}/api/v1/accounts/{account_id}",
+            headers={"api_access_token": token},
+            timeout=20,
+            transport=transport,
+        )
+
+    def articles(self) -> list[Article]:
+        fresh = (
+            self._fetched_at is not None
+            and self._now() - self._fetched_at < self._ttl
+        )
+        if fresh:
+            return self._cached
+
+        response = self._client.get(f"/portals/{self._portal}/articles")
+        response.raise_for_status()
+        body = response.json()
+        rows = body.get("payload", body) if isinstance(body, dict) else body
+        self._cached = [
+            Article(title=row.get("title") or "", content=row.get("content") or "")
+            for row in rows
+            if isinstance(row, dict) and (row.get("title") or row.get("content"))
+        ]
+        self._fetched_at = self._now()
+        log.info("help centre: %s articles loaded", len(self._cached))
+        return self._cached
+
+    def relevant(self, question: str, limit: int = 3) -> list[Article]:
+        wanted = keywords(question)
+        if not wanted:
+            return []
+
+        scored = []
+        for article in self.articles():
+            title_hits = overlap(wanted, article.title)
+            body_hits = overlap(wanted, article.content)
+            score = title_hits * self.TITLE_WEIGHT + body_hits
+            if score:
+                scored.append((score, article))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [article for _, article in scored[:limit]]
 
 
 # --------------------------------------------------------------------------
@@ -739,17 +881,45 @@ class Brain:
             return None
         return Classification(intent=intent, confidence=confidence)
 
-    def answer(self, message: str, knowledge: str) -> str:
+    def answer(
+        self, message: str, knowledge: str, articles: Sequence[Article] = ()
+    ) -> str:
+        """Write a reply.
+
+        Two separate inputs, deliberately. `knowledge` is how to behave: tone,
+        when to ask a follow-up, and the standing rule never to invent. The
+        articles are what may be stated as fact. Keeping them apart is what lets
+        the documentation change without touching the instructions.
+        """
+        instructions = [
+            "You are a customer support agent.",
+            "",
+            "How to behave:",
+            knowledge,
+        ]
+        if articles:
+            instructions += [
+                "",
+                "Documentation you may state as fact. Use only what is here for "
+                "anything specific about the product, its prices or its "
+                "policies. Do not add details that are not written below.",
+                "",
+            ]
+            instructions += [
+                f"## {article.title}\n{article.content}" for article in articles
+            ]
+        else:
+            instructions += [
+                "",
+                "No documentation matched this question, so do not state "
+                "anything specific about the product, its prices or its "
+                "policies. Answer generally if you can, otherwise say a "
+                "colleague will follow up.",
+            ]
+
         return self._chat(
             [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a customer support agent. Answer using only the "
-                        "guidance below. If it does not cover the question, say "
-                        "you are passing it to a colleague.\n\n" + knowledge
-                    ),
-                },
+                {"role": "system", "content": "\n".join(instructions)},
                 {"role": "user", "content": message},
             ],
             **self._provider_preferences(),
@@ -858,6 +1028,20 @@ def main() -> None:
         in ("1", "true", "yes"),
     )
 
+    portal = env_value("HELP_CENTRE_PORTAL")
+    help_centre = (
+        ChatwootHelpCentre(
+            base_url=chatwoot_url,
+            account_id=env_value("CHATWOOT_ACCOUNT_ID", default="1"),
+            token=env_value("CHATWOOT_TOKEN"),
+            portal_slug=portal,
+        )
+        if portal
+        else None
+    )
+    if help_centre is None:
+        log.info("no HELP_CENTRE_PORTAL set, answering from %s alone", knowledge_path)
+
     interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
     log.info("polling %s every %ss, knowledge from %s", chatwoot_url, interval, knowledge_path)
     run_forever(
@@ -867,6 +1051,7 @@ def main() -> None:
         payments=payments,
         classify=brain.classify,
         answer=brain.answer,
+        help_centre=help_centre,
     )
 
 

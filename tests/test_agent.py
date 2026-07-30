@@ -89,7 +89,7 @@ def classifier(intent, confidence=0.95):
 
 
 def answerer(text="here is your answer"):
-    return lambda message, knowledge: text
+    return lambda message, knowledge, articles=(): text
 
 
 def run(conv, *, inbox=None, payments=None, intent="support", confidence=0.95):
