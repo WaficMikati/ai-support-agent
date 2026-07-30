@@ -34,13 +34,13 @@
 
   <script>
     (function (d, t) {
-      var BASE_URL = "http://localhost:3000";
+      var BASE_URL = "__CHATWOOT_URL__";
       var g = d.createElement(t), s = d.getElementsByTagName(t)[0];
       g.src = BASE_URL + "/packs/js/sdk.js";
       g.defer = true; g.async = true;
       s.parentNode.insertBefore(g, s);
       g.onload = function () {
-        window.chatwootSDK.run({ websiteToken: "RhFSY9waaN1NfZMe3ZmidenE", baseUrl: BASE_URL });
+        window.chatwootSDK.run({ websiteToken: "__WIDGET_TOKEN__", baseUrl: BASE_URL });
       };
     })(document, "script");
 

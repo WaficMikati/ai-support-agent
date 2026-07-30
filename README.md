@@ -290,7 +290,12 @@ uv run python demo/serve.py    # then open http://localhost:8080
 ```
 
 A one-file page carrying the widget snippet, which is also what a workshop
-attendee ends up with. It identifies the visitor the way a real site does for a
+attendee ends up with. The Chatwoot URL and widget token are injected when the
+page is served, from the same configuration as everything else, rather than
+typed into the HTML. A widget token is not a secret, since it appears in the
+page source of every site running Chatwoot, but hardcoding it meant anyone else
+running this got a silently dead widget until they edited the file. If no token
+is configured the page says so instead of just failing to show a chat bubble. It identifies the visitor the way a real site does for a
 signed-in customer, because an anonymous visitor has no email and the refund
 path matches customers by email.
 

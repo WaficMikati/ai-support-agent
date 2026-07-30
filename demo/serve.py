@@ -113,9 +113,52 @@ def new_customer() -> dict[str, str]:
     return {"email": email, "identifier": f"demo-{stamp}", "name": "Demo Customer"}
 
 
+def page_settings() -> dict[str, str]:
+    """The two values the page needs, from the same config as everything else.
+
+    They used to be typed into the HTML. That is not a leak, since a widget
+    token appears in the page source of every site running Chatwoot, but it is
+    configuration hardcoded in a second place: anybody else running this got a
+    dead widget until they hand-edited the file.
+    """
+    config = reset_demo.settings()
+    return {
+        "__CHATWOOT_URL__": config.get("CHATWOOT_URL", "http://localhost:3000"),
+        "__WIDGET_TOKEN__": config.get(
+            "CHATWOOT_WIDGET_TOKEN", config.get("widget_token", "")
+        ),
+    }
+
+
 class DemoHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT / "demo"), **kwargs)
+
+    def do_GET(self) -> None:  # noqa: N802  (http.server naming)
+        if self.path.rstrip("/") not in ("", "/index.html"):
+            super().do_GET()
+            return
+
+        page = (ROOT / "demo" / "index.html").read_text()
+        values = page_settings()
+        if not values["__WIDGET_TOKEN__"]:
+            # Say so on the page. A blank token gives a widget that silently
+            # never appears, which is a miserable thing to debug.
+            page = page.replace(
+                "</h1>",
+                "</h1><p style='color:#b00'>No widget token found. Set "
+                "CHATWOOT_WIDGET_TOKEN in .env, or widget_token in "
+                "deploy/admin.local.txt.</p>",
+            )
+        for placeholder, value in values.items():
+            page = page.replace(placeholder, value)
+
+        body = page.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802  (http.server naming)
         if self.path.rstrip("/") != "/reset":
