@@ -15,18 +15,27 @@ class StopLoop(Exception):
 
 
 class RecordingInbox:
-    """Answers once per pass and records the knowledge it was given."""
+    """A new customer message on every pass, recording the knowledge used.
+
+    The message id increments because the agent now remembers what it has
+    already handled, so re-serving an identical message would correctly be
+    ignored rather than answered again.
+    """
 
     def __init__(self):
         self.replies: list[str] = []
         self.resolved: list[int] = []
+        self._next_id = 0
 
     def open_conversations(self):
+        self._next_id += 1
         return [
             Conversation(
                 id=1,
                 contact_email="a@b.com",
-                messages=(Message(id=1, content="hello", incoming=True),),
+                messages=(
+                    Message(id=self._next_id, content="hello", incoming=True),
+                ),
             )
         ]
 

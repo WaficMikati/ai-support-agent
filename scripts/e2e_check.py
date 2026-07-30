@@ -1,11 +1,11 @@
-"""End-to-end check: real Chatwoot, real Groq, real Stripe test mode.
+"""End-to-end check: real Chatwoot, real OpenRouter, real Stripe test mode.
 
 Every dependency is the live one. The model really classifies, Stripe really
 issues a refund, Chatwoot really receives the reply.
 
     uv run python scripts/e2e_check.py
 
-Needs .env with GROQ_API_KEY, STRIPE_API_KEY, CHATWOOT_* and, for the
+Needs .env with OPENROUTER_API_KEY, STRIPE_API_KEY, CHATWOOT_* and, for the
 refund scenarios, STRIPE_SETUP_KEY.
 
 Why a second Stripe key: the agent's restricted key is deliberately
@@ -28,9 +28,10 @@ sys.path.insert(0, str(ROOT))
 from agent import (  # noqa: E402
     MAX_AUTO_REFUND_CENTS,
     ChatwootInbox,
-    GroqBrain,
+    Brain,
     StripePayments,
     handle_conversation,
+    refund_idempotency_key,
 )
 
 failures: list[str] = []
@@ -188,7 +189,11 @@ def main() -> int:
     knowledge = (ROOT / env.get("KNOWLEDGE_FILE", "knowledge.md")).read_text()
     inbox = ChatwootInbox(base_url, account_id, token)
     payments = StripePayments(stripe_key)
-    brain = GroqBrain(env["GROQ_API_KEY"])
+    brain = Brain(
+        env["OPENROUTER_API_KEY"],
+        model=env.get("OPENROUTER_MODEL", Brain.DEFAULT_MODEL),
+        base_url=env.get("OPENROUTER_BASE_URL", Brain.DEFAULT_BASE_URL),
+    )
     admin = ChatwootAdmin(base_url, account_id, token, api_inbox)
     stamp = str(int(time.time()))
 
@@ -206,7 +211,7 @@ def main() -> int:
         raise AssertionError(f"conversation {conversation_id} not visible")
 
     # ---------------------------------------------------------- model only
-    print("\n1. the model classifies (real Groq call)")
+    print("\n1. the model classifies (real OpenRouter call)")
     refund_call = brain.classify("I want my money back for the bootcamp")
     check("refund wording classified as refund", refund_call.intent == "refund",
           f"{refund_call.intent} @ {refund_call.confidence:.2f}")
@@ -302,6 +307,29 @@ def main() -> int:
         notes = [m for m in admin.messages(conversation_id) if m.get("private")]
         check("held with a reason", bool(notes) and "limit" in (notes[0].get("content") or ""),
               (notes[0].get("content") or "")[:60] if notes else "")
+
+        # No model calls here: this is the backstop for a crash between issuing
+        # the refund and posting the reply, when the remembered message ids are
+        # gone and the agent tries the same refund again.
+        print("\n6. the same refund sent twice only moves money once")
+        email = f"twice-{stamp}@example.com"
+        charge_id = setup.customer_with_charge(email, 1_500)
+        key = refund_idempotency_key(999_001, 999_002)
+        first = payments.refund(charge_id, key)
+        second = payments.refund(charge_id, key)
+        check("Stripe returned the same refund both times", first == second,
+              f"{first} vs {second}")
+        refunds = httpx.get(
+            "https://api.stripe.com/v1/refunds",
+            params={"charge": charge_id, "limit": 10},
+            headers={"Authorization": f"Bearer {setup_key}"},
+            timeout=30,
+        )
+        refunds.raise_for_status()
+        rows = refunds.json()["data"]
+        check("exactly one refund exists on the charge", len(rows) == 1, f"{len(rows)} found")
+        check("and it is for the full amount once", sum(r["amount"] for r in rows) == 1_500,
+              str(sum(r["amount"] for r in rows)))
 
     print()
     if failures:

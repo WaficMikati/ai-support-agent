@@ -131,11 +131,19 @@ def test_amount_and_created_are_mapped():
 
 def test_refund_posts_the_charge_id_and_returns_the_refund_id():
     payments, seen = payments_for([charge_json("ch_1")])
-    assert payments.refund("ch_1") == "re_1"
+    assert payments.refund("ch_1", "refund-conv1-msg2") == "re_1"
     posts = [r for r in seen if r.method == "POST"]
     assert len(posts) == 1
     assert posts[0].url.path == "/v1/refunds"
     assert b"charge=ch_1" in posts[0].content
+
+
+def test_refund_sends_the_idempotency_key_as_a_header():
+    """Without this header a retry issues a second refund."""
+    payments, seen = payments_for([charge_json("ch_1")])
+    payments.refund("ch_1", "refund-conv7-msg42")
+    post = next(r for r in seen if r.method == "POST")
+    assert post.headers["Idempotency-Key"] == "refund-conv7-msg42"
 
 
 def test_requests_are_authorised():

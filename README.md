@@ -23,7 +23,7 @@ Chatwoot widget
 GET /conversations?status=open          poll, no webhooks, no tunnel
       │
       ▼
-classify → {intent, confidence}          Groq, strict JSON schema
+classify → {intent, confidence}          OpenRouter, strict JSON schema
       │
       ├── refund  → refund_decision()    pure function, no model
       │               ├── passes → Stripe refund + reply + resolve
@@ -38,6 +38,22 @@ twice. A private note counts as us speaking, which is what stops a held
 refund from being flagged again on every poll. Chatwoot's activity entries
 (labels, assignments, status changes) are ignored, since otherwise a label
 added after a customer writes in would look like a reply.
+
+That rule is correct but not instantaneous, so two more things guard against
+acting on the same message twice:
+
+- **The agent remembers the message ids it has handled.** Between classifying
+  a message and posting the reply, the customer's message is still the newest
+  thing in the conversation, so an overlapping pass, or a second copy of the
+  agent, would pick it up again. Ids are recorded only after the work
+  succeeds, so a transient failure is retried rather than swallowed. This is
+  in memory, and therefore gone on restart.
+- **Refunds carry a Stripe idempotency key** derived from the conversation and
+  message id, `refund-conv482-msg91`. If the same request ever reaches Stripe
+  twice, whether from a race or from a crash between issuing the refund and
+  posting the reply, Stripe returns the original refund instead of issuing a
+  second one. This is the backstop that survives a restart, and it is what
+  actually protects the money. Stripe keeps keys for at least 24 hours.
 
 Answered and refunded conversations are resolved. Chatwoot reopens one as
 soon as the customer writes again, so nothing is lost.
@@ -140,9 +156,9 @@ uv run python agent.py
 ## Tests
 
 ```bash
-uv run pytest                          # 68 tests, no network, no credentials
+uv run pytest                          # 97 tests, no network, no credentials
 uv run python scripts/live_check.py    # the inbox adapter against live Chatwoot
-uv run python scripts/e2e_check.py     # everything live: Groq, Stripe test mode, Chatwoot
+uv run python scripts/e2e_check.py     # everything live: OpenRouter, Stripe, Chatwoot
 uv run python scripts/reload_check.py  # editing knowledge.md with the agent running
 ```
 
@@ -157,9 +173,37 @@ restores the file afterwards.
 
 ## Credentials
 
-- **Groq** — console.groq.com, free tier, no card. Model
-  `openai/gpt-oss-20b`, one of the two Groq models supporting strict JSON
-  schema output. Rate limits are per organisation, not per key.
+- **OpenRouter** — openrouter.ai, free, no card. Model
+  `openai/gpt-oss-20b:free`. Current free models supporting structured output:
+  `https://openrouter.ai/api/v1/models?supported_parameters=structured_outputs`
+
+  **Do not rely on the schema alone.** OpenRouter serves a model through
+  several provider endpoints and only some enforce `strict: true` with
+  constrained decoding; the rest treat it as a suggestion. Requests send
+  `provider: {require_parameters: true}`, but that filters on what a provider
+  *advertises*, not on what it does. So the classifier prompt also spells out
+  the JSON contract. An earlier prompt said "reply with refund" and relied on
+  enforcement: a non-enforcing endpoint followed the words and returned prose,
+  which the enforcing one had been quietly covering up. Belt and braces is
+  also what makes the model and provider swappable.
+
+  `OPENROUTER_PROVIDER=Groq,Fireworks` pins the endpoint and disables
+  fallbacks, if you ever need to guarantee which one serves a request.
+
+  **Mind the quota.** Per OpenRouter's own rate-limit docs, `:free` models
+  allow 20 requests a minute and **50 a day in total** on an account that has
+  never bought credit, rising to 1,000 a day once $10 has been purchased at any
+  point. The agent spends one request classifying and a second writing the
+  answer, so roughly 25 conversations a day at the free ceiling.
+
+  That daily cap applies only to `:free` models. Paid models have no daily
+  request limit, only a credit balance, and are cheap here: a conversation
+  measures around 600 tokens across both calls. So $10 both lifts the free cap
+  and covers tens of thousands of conversations on the paid variant.
+
+  `OPENROUTER_BASE_URL` and `OPENROUTER_MODEL` accept any OpenAI-shaped
+  endpoint, so Groq, whose free tier allows thousands of requests a day,
+  remains a two-line change.
 - **Stripe** — a restricted key (`rk_test_`) created in a sandbox, with
   **Charges and refunds: write** and **Customers: read**, everything else
   None. Stripe has no standalone refunds permission, so write on "Charges

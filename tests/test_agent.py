@@ -52,12 +52,14 @@ class FakePayments:
     def __init__(self, charge=None):
         self.charge = charge
         self.refunded: list[str] = []
+        self.keys: list[str] = []
 
     def latest_charge(self, email):
         return self.charge
 
-    def refund(self, charge_id):
+    def refund(self, charge_id, idempotency_key):
         self.refunded.append(charge_id)
+        self.keys.append(idempotency_key)
         return "re_fake_1"
 
 

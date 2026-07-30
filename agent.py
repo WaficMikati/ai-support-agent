@@ -136,7 +136,7 @@ class Inbox(Protocol):
 
 class Payments(Protocol):
     def latest_charge(self, email: str) -> Charge | None: ...
-    def refund(self, charge_id: str) -> str: ...
+    def refund(self, charge_id: str, idempotency_key: str) -> str: ...
 
 
 class Classifier(Protocol):
@@ -210,6 +210,47 @@ def refund_decision(
 # --------------------------------------------------------------------------
 
 
+class HandledMessages:
+    """The messages this process has already acted on.
+
+    Deciding by "who spoke last" is correct but not instantaneous: between
+    classifying a message and posting the reply there is a window where the
+    customer's message is still the newest thing in the conversation. A second
+    overlapping pass, or a operator who starts the agent twice, would pick it
+    up again. Remembering the ids closes that window.
+
+    In memory only, which is deliberate for a demo but worth being clear about:
+    it is gone on restart. The Stripe idempotency key is what makes a restart
+    mid-refund safe, not this.
+    """
+
+    def __init__(self, capacity: int = 5_000):
+        self._capacity = capacity
+        self._ids: dict[int, None] = {}  # insertion-ordered, used as a bounded set
+
+    def __contains__(self, message_id: int) -> bool:
+        return message_id in self._ids
+
+    def add(self, message_id: int) -> None:
+        self._ids[message_id] = None
+        while len(self._ids) > self._capacity:
+            self._ids.pop(next(iter(self._ids)))
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+
+def refund_idempotency_key(conversation_id: int, message_id: int) -> str:
+    """A stable key for one refund request.
+
+    Derived from the conversation and the message that asked for it, so every
+    retry of the same request carries the same key and Stripe returns the
+    original refund instead of issuing a second one. No personal data in it,
+    and well inside Stripe's 255 character limit.
+    """
+    return f"refund-conv{conversation_id}-msg{message_id}"
+
+
 def needs_reply(conversation: Conversation) -> bool:
     """True when the customer spoke last.
 
@@ -234,12 +275,16 @@ def handle_conversation(
     classify: Classifier,
     answer: Answerer,
     knowledge: str,
+    handled: HandledMessages | None = None,
     now: datetime | None = None,
 ) -> str:
     """Process a single conversation. Returns the action taken, for logging."""
     latest = conversation.latest
     if latest is None or not latest.incoming:
         return "skipped"
+
+    if handled is not None and latest.id in handled:
+        return "already handled"
 
     result = classify(latest.content)
     log.info(
@@ -250,27 +295,35 @@ def handle_conversation(
     )
 
     if result.intent == "refund":
-        return _handle_refund(
+        action = _handle_refund(
             conversation,
             result,
+            message_id=latest.id,
             inbox=inbox,
             payments=payments,
             now=now,
         )
+    else:
+        reply = answer(latest.content, knowledge)
+        inbox.send_reply(conversation.id, reply)
+        # Resolved rather than left open: Chatwoot reopens a conversation as
+        # soon as the customer writes again, so nothing is lost and the inbox
+        # does not fill up with conversations we have already dealt with.
+        inbox.resolve(conversation.id)
+        action = "answered"
 
-    reply = answer(latest.content, knowledge)
-    inbox.send_reply(conversation.id, reply)
-    # Resolved rather than left open: Chatwoot reopens a conversation as soon
-    # as the customer writes again, so nothing is lost and the inbox does not
-    # fill up with conversations we have already dealt with.
-    inbox.resolve(conversation.id)
-    return "answered"
+    # Recorded only once the work succeeded. Marking it earlier would mean a
+    # transient model or network failure silently swallowed the message.
+    if handled is not None:
+        handled.add(latest.id)
+    return action
 
 
 def _handle_refund(
     conversation: Conversation,
     result: Classification,
     *,
+    message_id: int,
     inbox: Inbox,
     payments: Payments,
     now: datetime | None,
@@ -294,7 +347,12 @@ def _handle_refund(
         return "flagged"
 
     assert charge is not None  # guaranteed by refund_decision
-    refund_id = payments.refund(charge.id)
+    # If this same request is ever sent twice, whether by an overlapping pass
+    # or by a restart after a crash between the refund and the reply, Stripe
+    # returns the original refund rather than issuing another one.
+    refund_id = payments.refund(
+        charge.id, refund_idempotency_key(conversation.id, message_id)
+    )
     log.info("refunded charge %s (%s)", charge.id, refund_id)
     inbox.send_reply(
         conversation.id,
@@ -317,6 +375,7 @@ def run_once(
     classify: Classifier,
     answer: Answerer,
     knowledge: str,
+    handled: HandledMessages | None = None,
 ) -> list[str]:
     actions = []
     for conversation in inbox.open_conversations():
@@ -330,6 +389,7 @@ def run_once(
                 classify=classify,
                 answer=answer,
                 knowledge=knowledge,
+                handled=handled,
             )
         )
     return actions
@@ -348,9 +408,10 @@ def run_forever(
     editing it changes the agent's answers within one interval. That is the
     whole point of keeping the guidance in a text file.
     """
+    handled = kwargs.pop("handled", None) or HandledMessages()
     while True:
         try:
-            run_once(knowledge=knowledge_path.read_text(), **kwargs)
+            run_once(knowledge=knowledge_path.read_text(), handled=handled, **kwargs)
         except Exception:  # a bad poll should not kill the agent
             log.exception("poll failed")
         sleep(interval_seconds)
@@ -494,8 +555,12 @@ class StripePayments:
             sibling_unrefunded_count=siblings,
         )
 
-    def refund(self, charge_id: str) -> str:
-        response = self._client.post("/refunds", data={"charge": charge_id})
+    def refund(self, charge_id: str, idempotency_key: str) -> str:
+        response = self._client.post(
+            "/refunds",
+            data={"charge": charge_id},
+            headers={"Idempotency-Key": idempotency_key},
+        )
         response.raise_for_status()
         return response.json()["id"]
 
@@ -518,45 +583,117 @@ CLASSIFY_SCHEMA = {
     },
 }
 
+# The prompt states the output contract as well as sending the schema. Relying
+# on the schema alone is a mistake: only some provider endpoints enforce it
+# with constrained decoding, and the rest treat `strict` as a suggestion. An
+# earlier version of this prompt said "reply with refund", which a
+# non-enforcing provider followed to the letter and returned prose.
 CLASSIFY_PROMPT = """You sort incoming customer support messages.
 
-Reply with "refund" only when the customer is asking for their money back.
-Everything else, including complaints, questions about billing and requests
-to cancel, is "support".
+Classify the message as "refund" when the customer is asking for their money
+back. Everything else, including complaints, questions about billing and
+requests to cancel, is "support".
 
-confidence is how sure you are, from 0 to 1."""
+Respond with a single JSON object and nothing else, of exactly this shape:
+{"intent": "refund" or "support", "confidence": number between 0 and 1}
+
+confidence is how sure you are of the classification."""
 
 
-class GroqBrain:
+class Brain:
+    """The model, over OpenRouter.
+
+    The base URL is configurable because every provider worth using speaks the
+    same OpenAI-shaped API, so switching back to Groq or anywhere else is a
+    change of two environment variables rather than a change of code.
+    """
+
+    DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+    DEFAULT_MODEL = "openai/gpt-oss-20b:free"
+
     def __init__(
         self,
         api_key: str,
-        model: str = "openai/gpt-oss-20b",
+        model: str = DEFAULT_MODEL,
+        base_url: str = DEFAULT_BASE_URL,
+        provider_order: tuple[str, ...] = (),
         transport: httpx.BaseTransport | None = None,
         sleep=time.sleep,
     ):
         self._model = model
         self._sleep = sleep
+        # `provider` is an OpenRouter extension. Sending it to a plain
+        # OpenAI-shaped endpoint like Groq risks a rejected request, so it only
+        # goes out when we are actually talking to OpenRouter.
+        self._openrouter = "openrouter.ai" in base_url
+        self._provider: dict[str, object] = {}
+        if provider_order:
+            # Pinning matters: a model can be served by several providers and
+            # some advertise strict schema support without honouring it. Naming
+            # the provider and refusing fallbacks is the only way to be sure.
+            self._provider["order"] = list(provider_order)
+            self._provider["allow_fallbacks"] = False
         self._client = httpx.Client(
-            base_url="https://api.groq.com/openai/v1",
+            base_url=base_url,
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=30,
             transport=transport,
         )
 
+    INTENTS = ("refund", "support")
+
     def classify(self, message: str) -> Classification:
-        payload = self._chat(
-            [
-                {"role": "system", "content": CLASSIFY_PROMPT},
-                {"role": "user", "content": message},
-            ],
-            response_format={"type": "json_schema", "json_schema": CLASSIFY_SCHEMA},
+        """Classify one message, retrying if the reply is not usable.
+
+        Only some provider endpoints enforce the schema with constrained
+        decoding. The rest generate JSON by following instructions, which is
+        probabilistic: it is usually right and occasionally malformed. Since
+        the model is stochastic, asking again is the appropriate response to an
+        unusable answer rather than crashing the poll.
+        """
+        last_payload = ""
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            last_payload = self._chat(
+                [
+                    {"role": "system", "content": CLASSIFY_PROMPT},
+                    {"role": "user", "content": message},
+                ],
+                response_format={"type": "json_schema", "json_schema": CLASSIFY_SCHEMA},
+                **self._provider_preferences(require_parameters=True),
+            )
+            classification = self._parse(last_payload)
+            if classification is not None:
+                return classification
+            log.warning(
+                "classification %s of %s was not usable: %r",
+                attempt,
+                self.MAX_ATTEMPTS,
+                last_payload[:120],
+            )
+
+        raise RuntimeError(
+            f"model did not return a usable classification after "
+            f"{self.MAX_ATTEMPTS} attempts. Last reply: {last_payload[:300]}"
         )
-        parsed = json.loads(payload)
-        return Classification(
-            intent=parsed["intent"],
-            confidence=float(parsed["confidence"]),
-        )
+
+    def _parse(self, payload: str) -> Classification | None:
+        """A classification, or None if the reply cannot be trusted.
+
+        An out-of-range confidence or an unknown intent is treated the same as
+        malformed JSON. Letting either through would quietly corrupt the refund
+        decision, which reads confidence as a number and compares it to a
+        threshold.
+        """
+        try:
+            parsed = json.loads(payload)
+            intent = parsed["intent"]
+            confidence = float(parsed["confidence"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+        if intent not in self.INTENTS or not 0.0 <= confidence <= 1.0:
+            return None
+        return Classification(intent=intent, confidence=confidence)
 
     def answer(self, message: str, knowledge: str) -> str:
         return self._chat(
@@ -570,12 +707,28 @@ class GroqBrain:
                     ),
                 },
                 {"role": "user", "content": message},
-            ]
+            ],
+            **self._provider_preferences(),
         )
 
-    # Groq has been observed returning a one-off 400 for a request that then
-    # succeeds unchanged, so 400 is retried rather than treated as permanent.
-    # A genuinely malformed request just fails three times quickly and reports
+    def _provider_preferences(self, *, require_parameters: bool = False) -> dict:
+        """OpenRouter's provider routing block, when it applies.
+
+        `require_parameters` asks OpenRouter not to route to endpoints that do
+        not advertise the parameters we sent. It is necessary but not
+        sufficient: an endpoint can advertise strict schema support and still
+        return prose, which is what `provider_order` is for.
+        """
+        if not self._openrouter:
+            return {}
+        preferences = dict(self._provider)
+        if require_parameters:
+            preferences["require_parameters"] = True
+        return {"provider": preferences} if preferences else {}
+
+    # A one-off 400 has been observed for a request that then succeeds
+    # unchanged, so 400 is retried rather than treated as permanent. A
+    # genuinely malformed request just fails three times quickly and reports
     # the response body, which raise_for_status() would have hidden.
     RETRY_ON = {400, 408, 409, 425, 429, 500, 502, 503, 504}
     MAX_ATTEMPTS = 3
@@ -589,11 +742,11 @@ class GroqBrain:
 
             if response.status_code not in self.RETRY_ON or attempt == self.MAX_ATTEMPTS:
                 raise RuntimeError(
-                    f"Groq returned {response.status_code} after {attempt} "
+                    f"model API returned {response.status_code} after {attempt} "
                     f"attempt(s): {response.text[:300]}"
                 )
             delay = 2 ** (attempt - 1)
-            log.warning("groq returned %s, retrying in %ss", response.status_code, delay)
+            log.warning("model API returned %s, retrying in %ss", response.status_code, delay)
             self._sleep(delay)
         raise AssertionError("unreachable")
 
@@ -629,9 +782,17 @@ def main() -> None:
         token=require_env("CHATWOOT_TOKEN", "Chatwoot Profile Settings -> Access Token."),
     )
     payments = StripePayments(stripe_key)
-    brain = GroqBrain(
-        require_env("GROQ_API_KEY", "Free from console.groq.com, no card needed."),
-        model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"),
+    brain = Brain(
+        require_env(
+            "OPENROUTER_API_KEY", "Free from openrouter.ai, no card needed."
+        ),
+        model=os.environ.get("OPENROUTER_MODEL", Brain.DEFAULT_MODEL),
+        base_url=os.environ.get("OPENROUTER_BASE_URL", Brain.DEFAULT_BASE_URL),
+        provider_order=tuple(
+            name.strip()
+            for name in os.environ.get("OPENROUTER_PROVIDER", "").split(",")
+            if name.strip()
+        ),
     )
 
     interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
