@@ -39,6 +39,37 @@ understand → {reply, refund_requested, confidence}    one model call
 reply, and says separately whether a refund is being requested. Whether money
 moves is settled afterwards against thresholds it never sees.
 
+That flow is written as a graph, because the routing is the interesting part and
+it deserves to be visible:
+
+```python
+NODES = {"understand": ..., "answer": ..., "refund": ..., "execute_refund": ..., "hold": ...}
+
+EDGES = {
+    "understand": lambda s: "refund" if s.proposal.refund_requested else "answer",
+    "refund":     lambda s: "execute_refund" if s.decision.auto_approve else "hold",
+    "answer": lambda s: None, "execute_refund": lambda s: None, "hold": lambda s: None,
+}
+
+def run_graph(state, start="understand"):
+    node = start
+    while node:
+        state = NODES[node](state)
+        node = EDGES[node](state)
+    return state
+```
+
+No framework, and none needed: a graph is a dict of functions and a dict of
+routing rules. Writing it out is worth more than importing it here, because the
+decision that matters is now a line you can point at. The edge out of
+`understand` is the model's, and the edge out of `refund` is `refund_decision`'s.
+The model can ask for money to move; it cannot make it move.
+
+`refund` deliberately decides nothing itself: it looks up the charge, applies the
+policy, and leaves the routing to the edge. Nodes are `state -> state`, so each
+runs on its own with fakes, and the graph's shape is testable in its own right,
+that every node has an edge and every route leads somewhere real.
+
 This replaced a design that reduced each message to one of two labels before
 anything was understood, and it was replaced for two reasons. It could not hold a
 conversation, because only the newest message was ever sent: "it was due last

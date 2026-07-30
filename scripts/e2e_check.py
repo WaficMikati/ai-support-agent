@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 from agent import (  # noqa: E402
     MAX_AUTO_REFUND_CENTS,
     Brain,
+    ChatwootHelpCentre,
     ChatwootInbox,
     StripePayments,
     Turn,
@@ -222,6 +223,10 @@ def main() -> int:
     knowledge = (ROOT / env.get("KNOWLEDGE_FILE", "knowledge.md")).read_text()
     inbox = ChatwootInbox(base_url, account_id, token)
     payments = StripePayments(stripe_key)
+    portal = env_value("HELP_CENTRE_PORTAL")
+    help_centre = (
+        ChatwootHelpCentre(base_url, account_id, token, portal) if portal else None
+    )
     # Resolve the model exactly as agent.py does, or this checks a different
     # provider than the one actually running.
     load_env_file(ROOT / ".env")
@@ -245,6 +250,7 @@ def main() -> int:
                     payments=payments,
                     understand=brain.understand,
                     knowledge=knowledge,
+                    help_centre=help_centre,
                 )
         raise AssertionError(f"conversation {conversation_id} not visible")
 
@@ -264,19 +270,23 @@ def main() -> int:
 
     # ------------------------------------------------------- support path
     print("\n2. support question answered from knowledge.md")
-    conversation_id = admin.conversation_with(
-        f"support-{stamp}@example.com", "I can't log in and the reset email never arrives"
-    )
+    question = "my delivery has not arrived, what should I do?"
+    conversation_id = admin.conversation_with(f"support-{stamp}@example.com", question)
     action = act(conversation_id)
     check("action is 'answered'", action == "answered", action)
     posted = [m for m in admin.messages(conversation_id) if m["message_type"] == 1]
     check("a public reply was posted", len(posted) == 1)
     if posted:
-        body = (posted[0].get("content") or "").lower()
         check("reply is not private", not posted[0].get("private"))
-        check("reply draws on the knowledge file",
-              any(word in body for word in ("spam", "reset", "sign-in", "sign in", "colleague")),
+        check("the reply is not empty", bool((posted[0].get("content") or "").strip()),
               (posted[0].get("content") or "")[:70])
+    # Assert on retrieval rather than on the wording. Which article is found is
+    # deterministic; how the model phrases an answer from it is not, and a test
+    # that greps generated prose for chosen words fails on a good reply.
+    if help_centre is not None:
+        found = [a.title for a in help_centre.relevant(question)]
+        check("the right article was found for it", "My delivery has not arrived" in found,
+              ", ".join(found) or "nothing")
     check("answered conversation is resolved", admin.status(conversation_id) == "resolved",
           admin.status(conversation_id))
 

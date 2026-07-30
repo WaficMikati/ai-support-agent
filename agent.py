@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 
 import httpx
 
@@ -423,6 +423,182 @@ def needs_reply(conversation: Conversation) -> bool:
 # --------------------------------------------------------------------------
 
 
+@dataclass
+class State:
+    """What one conversation carries as it moves through the graph.
+
+    Mutable and passed from node to node, which is the whole trick: each node is
+    `state -> state`, so the routing can live in data rather than in nested ifs.
+    Everything the nodes talk to is in here too, so a node never reaches for a
+    global and a test can hand it fakes.
+    """
+
+    conversation: Conversation
+    message: Message
+    knowledge: str
+    inbox: Inbox
+    payments: Payments
+    understand: Understander
+    help_centre: HelpCentre | None = None
+    now: datetime | None = None
+
+    articles: tuple[Article, ...] = ()
+    proposal: Proposal | None = None
+    charge: Charge | None = None
+    decision: Decision | None = None
+    action: str = ""
+
+
+# --------------------------------------------------------------------------
+# The graph: nodes do the work, edges choose what happens next.
+#
+# There is no framework here and there does not need to be one. A graph is a
+# dict of functions and a dict of routing rules, and writing it out is worth
+# more than importing it, because the one decision that matters is visible as an
+# edge: `understand` proposes, and the edge out of `refund` is chosen by
+# refund_decision in code. The model can ask for money to move. It cannot make
+# it move.
+# --------------------------------------------------------------------------
+
+
+def understand_node(state: State) -> State:
+    """Read the conversation, fetch anything relevant, propose a reply."""
+    turns = state.conversation.turns()
+    articles = (
+        state.help_centre.relevant(retrieval_query(turns)) if state.help_centre else []
+    )
+    state.articles = tuple(articles)
+    if articles:
+        log.info(
+            "conversation %s retrieved %s",
+            state.conversation.id,
+            ", ".join(article.title for article in articles),
+        )
+
+    state.proposal = state.understand(turns, state.knowledge, state.articles)
+    log.info(
+        "conversation %s: refund_requested=%s (%.2f) over %s turns",
+        state.conversation.id,
+        state.proposal.refund_requested,
+        state.proposal.confidence,
+        len(turns),
+    )
+    return state
+
+
+def answer_node(state: State) -> State:
+    """Send the reply the model wrote, and close the turn."""
+    assert state.proposal is not None
+    state.inbox.send_reply(state.conversation.id, state.proposal.reply)
+    # Resolved rather than left open: Chatwoot reopens a conversation as soon as
+    # the customer writes again, so nothing is lost and the inbox does not fill
+    # up with conversations we have already dealt with.
+    state.inbox.resolve(state.conversation.id)
+    state.action = "answered"
+    return state
+
+
+def refund_node(state: State) -> State:
+    """Find the charge and apply the policy. No model involved.
+
+    Deliberately decides nothing about the conversation: it works out the facts
+    and lets the edge do the routing, so the approval is a line you can point at.
+    """
+    assert state.proposal is not None
+    state.charge = (
+        state.payments.latest_charge(state.conversation.contact_email)
+        if state.conversation.contact_email
+        else None
+    )
+    state.decision = refund_decision(
+        state.charge, state.proposal.confidence, now=state.now
+    )
+    return state
+
+
+def execute_refund_node(state: State) -> State:
+    """Move the money, then say so with the real amount."""
+    assert state.charge is not None  # guaranteed by refund_decision
+    assert state.proposal is not None
+    # If this same request is ever sent twice, whether by an overlapping pass or
+    # by a restart after a crash between the refund and the reply, Stripe returns
+    # the original refund rather than issuing another one.
+    refund_id = state.payments.refund(
+        state.charge.id,
+        refund_idempotency_key(state.conversation.id, state.charge.id),
+    )
+    log.info("refunded charge %s (%s)", state.charge.id, refund_id)
+    # Written here rather than by the model, because it states an amount.
+    state.inbox.send_reply(
+        state.conversation.id,
+        f"That's refunded, {state.charge.amount_cents / 100:.2f} is on its way "
+        "back to your original payment method. It usually lands within a few days.",
+    )
+    state.inbox.resolve(state.conversation.id)
+    state.action = "refunded"
+    return state
+
+
+def hold_node(state: State) -> State:
+    """Hand it to a person, and tell the customer that is what happened."""
+    assert state.proposal is not None and state.decision is not None
+    # Tell the customer something, then tell the team why. Posting only the note
+    # leaves the customer staring at silence, which is indistinguishable from a
+    # broken agent: they asked for a refund and nothing came back.
+    #
+    # The model's own reply is used, so a message that asked two things gets both
+    # addressed. It was told not to promise an outcome, and if it did anyway the
+    # safe wording replaces it: the customer must not be told their money is
+    # coming back when a human has not agreed to it.
+    state.inbox.send_reply(
+        state.conversation.id, safe_holding_reply(state.proposal.reply)
+    )
+    # Deliberately left open, and not resolved: a person still has to act.
+    state.inbox.add_private_note(
+        state.conversation.id,
+        "Refund request held for review.\n"
+        f"Reason: {state.decision.reason}\n"
+        f"Signals: {state.proposal.signals}\n\n"
+        "The customer has been told a colleague will follow up.",
+    )
+    state.action = "flagged"
+    return state
+
+
+NODES: dict[str, Callable[[State], State]] = {
+    "understand": understand_node,
+    "answer": answer_node,
+    "refund": refund_node,
+    "execute_refund": execute_refund_node,
+    "hold": hold_node,
+}
+
+EDGES: dict[str, Callable[[State], str | None]] = {
+    # What the model asked for.
+    "understand": lambda s: "refund" if s.proposal.refund_requested else "answer",
+    # What the policy allows. This edge is the money gate, and nothing the model
+    # returned is consulted here beyond the rubric score the policy scores itself.
+    "refund": lambda s: "execute_refund" if s.decision.auto_approve else "hold",
+    "answer": lambda s: None,
+    "execute_refund": lambda s: None,
+    "hold": lambda s: None,
+}
+
+
+def run_graph(state: State, start: str = "understand") -> State:
+    """Walk the graph until an edge says to stop."""
+    node: str | None = start
+    while node:
+        state = NODES[node](state)
+        node = EDGES[node](state)
+    return state
+
+
+# --------------------------------------------------------------------------
+# Handling one conversation
+# --------------------------------------------------------------------------
+
+
 def handle_conversation(
     conversation: Conversation,
     *,
@@ -434,7 +610,7 @@ def handle_conversation(
     handled: HandledMessages | None = None,
     now: datetime | None = None,
 ) -> str:
-    """Process a single conversation. Returns the action taken, for logging."""
+    """Decide whether this conversation is ours to touch, then run the graph."""
     latest = conversation.latest
     if latest is None or not latest.incoming:
         return "skipped"
@@ -447,94 +623,25 @@ def handle_conversation(
     if conversation.handled_message_id == latest.id:
         return "already handled"
 
-    turns = conversation.turns()
-    articles = help_centre.relevant(retrieval_query(turns)) if help_centre else []
-    if articles:
-        log.info(
-            "conversation %s retrieved %s",
-            conversation.id,
-            ", ".join(article.title for article in articles),
+    state = run_graph(
+        State(
+            conversation=conversation,
+            message=latest,
+            knowledge=knowledge,
+            inbox=inbox,
+            payments=payments,
+            understand=understand,
+            help_centre=help_centre,
+            now=now,
         )
-
-    proposal = understand(turns, knowledge, articles)
-    log.info(
-        "conversation %s: refund_requested=%s (%.2f) over %s turns",
-        conversation.id,
-        proposal.refund_requested,
-        proposal.confidence,
-        len(turns),
     )
-
-    if proposal.refund_requested:
-        action = _handle_refund(
-            conversation, proposal, inbox=inbox, payments=payments, now=now
-        )
-    else:
-        inbox.send_reply(conversation.id, proposal.reply)
-        # Resolved rather than left open: Chatwoot reopens a conversation as
-        # soon as the customer writes again, so nothing is lost and the inbox
-        # does not fill up with conversations we have already dealt with.
-        inbox.resolve(conversation.id)
-        action = "answered"
 
     # Recorded only once the work succeeded. Marking it earlier would mean a
     # transient model or network failure silently swallowed the message.
     if handled is not None:
         handled.add(latest.id)
     inbox.record_handled(conversation.id, latest.id)
-    return action
-
-
-def _handle_refund(
-    conversation: Conversation,
-    proposal: Proposal,
-    *,
-    inbox: Inbox,
-    payments: Payments,
-    now: datetime | None,
-) -> str:
-    charge = (
-        payments.latest_charge(conversation.contact_email)
-        if conversation.contact_email
-        else None
-    )
-    decision = refund_decision(charge, proposal.confidence, now=now)
-
-    if not decision.auto_approve:
-        # Tell the customer something, then tell the team why. Posting only the
-        # note leaves the customer staring at silence, which is indistinguishable
-        # from a broken agent: they asked for a refund and nothing came back.
-        #
-        # The model's own reply is used, so a message that asked two things gets
-        # both addressed. It was told not to promise an outcome, and if it did
-        # anyway the safe wording replaces it: the customer must not be told
-        # their money is coming back when a human has not agreed to it.
-        inbox.send_reply(conversation.id, safe_holding_reply(proposal.reply))
-        # Deliberately left open, and not resolved: a person still has to act.
-        inbox.add_private_note(
-            conversation.id,
-            "Refund request held for review.\n"
-            f"Reason: {decision.reason}\n"
-            f"Signals: {proposal.signals}\n\n"
-            "The customer has been told a colleague will follow up.",
-        )
-        return "flagged"
-
-    assert charge is not None  # guaranteed by refund_decision
-    # If this same request is ever sent twice, whether by an overlapping pass
-    # or by a restart after a crash between the refund and the reply, Stripe
-    # returns the original refund rather than issuing another one.
-    refund_id = payments.refund(
-        charge.id, refund_idempotency_key(conversation.id, charge.id)
-    )
-    log.info("refunded charge %s (%s)", charge.id, refund_id)
-    inbox.send_reply(
-        conversation.id,
-        f"That's refunded, {charge.amount_cents / 100:.2f} is on its way back to "
-        "your original payment method. It usually lands within a few days.",
-    )
-    inbox.resolve(conversation.id)
-    return "refunded"
+    return state.action
 
 
 # --------------------------------------------------------------------------
