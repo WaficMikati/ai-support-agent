@@ -76,10 +76,17 @@ def clear_queue(config: dict[str, str]) -> int:
 # There is one condition that cannot be set up this way: MAX_CHARGE_AGE_DAYS.
 # Stripe stamps `created` itself and will not accept one, so a charge is always
 # from today and "too old" cannot be reached with a real test charge.
-HISTORIES = ("clean", "refunded", "prior", "multiple", "none")
+HISTORIES = ("clean", "refunded", "disputed", "prior", "multiple", "none")
+
+# Stripe's own test token for a charge the cardholder immediately disputes.
+# A real card number cannot be posted here: /v1/tokens answers 402 unless the
+# card was tokenised in a browser.
+DISPUTE_SOURCE = "tok_createDispute"
 
 
-def new_customer(amount_cents: int = 0, history: str = "clean") -> dict[str, str]:
+def new_customer(
+    amount_cents: int = 0, history: str = "clean", backdate_days: int = 0
+) -> dict[str, str]:
     """Provision a brand new customer for a fresh conversation.
 
     Deliberately not by deleting anything. Two constraints force this shape:
@@ -107,22 +114,26 @@ def new_customer(amount_cents: int = 0, history: str = "clean") -> dict[str, str
             headers={"Authorization": f"Bearer {setup_key}"},
             timeout=30,
         )
+        source = DISPUTE_SOURCE if history == "disputed" else "tok_visa"
         customer = client.post(
-            "/customers", data={"email": email, "source": "tok_visa"}
+            "/customers", data={"email": email, "source": source}
         )
         customer.raise_for_status()
         customer_id = customer.json()["id"]
 
         def charge_for(cents: int, description: str) -> str:
-            made = client.post(
-                "/charges",
-                data={
-                    "amount": cents,
-                    "currency": "usd",
-                    "customer": customer_id,
-                    "description": description,
-                },
-            )
+            data = {
+                "amount": cents,
+                "currency": "usd",
+                "customer": customer_id,
+                "description": description,
+            }
+            if backdate_days:
+                # Stripe stamps `created` itself and a test clock backdates the
+                # customer but not their charges, so the age is carried in
+                # metadata and applied when the charge is read back.
+                data["metadata[demo_backdate_days]"] = str(backdate_days)
+            made = client.post("/charges", data=data)
             made.raise_for_status()
             return made.json()["id"]
 
@@ -132,6 +143,11 @@ def new_customer(amount_cents: int = 0, history: str = "clean") -> dict[str, str
 
         if history == "none":
             pass  # A customer with nothing on file.
+        elif history == "disputed":
+            # Paid on a card that disputes it. The charge comes back from the
+            # create call with disputed still false; it is true by the time
+            # anything reads it again, which is all the agent ever does.
+            charge_for(amount, "demo subscription payment")
         elif history == "refunded":
             refund(charge_for(amount, "demo subscription payment"))
         elif history == "prior":
@@ -151,6 +167,7 @@ def new_customer(amount_cents: int = 0, history: str = "clean") -> dict[str, str
         "name": "Demo Customer",
         "history": history,
         "amount_cents": str(amount),
+        "backdate_days": str(backdate_days),
     }
 
 
@@ -216,6 +233,7 @@ class DemoHandler(SimpleHTTPRequestHandler):
                 **new_customer(
                     amount_cents=int(asked.get("amount_cents") or 0),
                     history=str(asked.get("history") or "clean"),
+                    backdate_days=int(asked.get("backdate_days") or 0),
                 ),
             }
         except Exception as error:  # the page should show what went wrong

@@ -45,10 +45,17 @@
       <option value="9000">$90.00 — over the limit, needs a person</option>
     </select>
 
+    <label for="age">Payment date</label>
+    <select id="age">
+      <option value="0">Today — inside the refund window</option>
+      <option value="45">45 days ago — outside the window</option>
+    </select>
+
     <label for="history">Account history</label>
     <select id="history">
       <option value="clean">One payment, nothing refunded</option>
       <option value="refunded">That payment is already refunded</option>
+      <option value="disputed">That payment is disputed with the bank</option>
       <option value="prior">An earlier payment was refunded before</option>
       <option value="multiple">Two payments, neither refunded</option>
       <option value="none">No payments at all</option>
@@ -103,7 +110,7 @@
     // describes something else is a confusing thing to have on a screen in
     // front of a room.
     (function () {
-      ["amount", "history"].forEach(function (id) {
+      ["amount", "age", "history"].forEach(function (id) {
         var select = document.getElementById(id);
         var saved = sessionStorage.getItem("demoChoice-" + id);
         if (saved) select.value = saved;
@@ -119,18 +126,22 @@
         var cleared = sessionStorage.getItem("demoResetCleared") || "0";
         var history = sessionStorage.getItem("demoResetHistory") || "clean";
         var amount = sessionStorage.getItem("demoResetAmount") || "";
+        var days = parseInt(sessionStorage.getItem("demoResetAge") || "0", 10);
         sessionStorage.removeItem("demoResetEmail");
         sessionStorage.removeItem("demoResetCleared");
         sessionStorage.removeItem("demoResetHistory");
         sessionStorage.removeItem("demoResetAmount");
+        sessionStorage.removeItem("demoResetAge");
         // Say what was actually set up, so what the agent does next can be
         // checked against it rather than taken on trust.
         var money = amount ? "$" + (parseInt(amount, 10) / 100).toFixed(2) : "a payment";
+        var when = days ? " from " + days + " days ago" : " from today";
         var SETUP = {
-          clean: "one payment of " + money + ", nothing refunded",
-          refunded: "one payment of " + money + ", already refunded",
-          prior: "a payment of " + money + ", after an earlier one was refunded",
-          multiple: "two payments of " + money + ", neither refunded",
+          clean: "one payment of " + money + when + ", nothing refunded",
+          refunded: "one payment of " + money + when + ", already refunded",
+          disputed: "one payment of " + money + when + ", disputed with the bank",
+          prior: "a payment of " + money + when + ", after an earlier one was refunded",
+          multiple: "two payments of " + money + when + ", neither refunded",
           none: "no payments at all",
         };
         document.getElementById("reset-note").textContent =
@@ -172,6 +183,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           amount_cents: parseInt(document.getElementById("amount").value, 10),
+          backdate_days: parseInt(document.getElementById("age").value, 10),
           history: document.getElementById("history").value,
         }),
       })
@@ -197,6 +209,7 @@
           sessionStorage.setItem("demoResetEmail", body.email);
           sessionStorage.setItem("demoResetCleared", String(body.cleared || 0));
           sessionStorage.setItem("demoResetHistory", body.history || "clean");
+          sessionStorage.setItem("demoResetAge", body.backdate_days || "0");
           sessionStorage.setItem("demoResetAmount", body.amount_cents || "");
           note.textContent = "Fresh conversation ready, reloading…";
           location.reload();

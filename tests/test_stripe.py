@@ -12,13 +12,23 @@ NOW_TS = 1_785_000_000
 CUSTOMER = {"id": "cus_1", "email": "a@b.com"}
 
 
-def charge_json(charge_id, amount=2_000, refunded=False, amount_refunded=0, created=NOW_TS):
+def charge_json(
+    charge_id,
+    amount=2_000,
+    refunded=False,
+    amount_refunded=0,
+    created=NOW_TS,
+    disputed=False,
+    metadata=None,
+):
     return {
         "id": charge_id,
         "amount": amount,
         "created": created,
         "refunded": refunded,
         "amount_refunded": amount_refunded,
+        "disputed": disputed,
+        "metadata": metadata or {},
     }
 
 
@@ -124,6 +134,48 @@ def test_amount_and_created_are_mapped():
     assert charge.amount_cents == 12_345
     assert int(charge.created.timestamp()) == NOW_TS
     assert charge.created.tzinfo is not None, "must be timezone aware for age checks"
+
+
+def test_a_dispute_is_carried_through():
+    payments, _ = payments_for([charge_json("ch_1", disputed=True)])
+    charge = payments.latest_charge("a@b.com")
+    assert charge is not None and charge.disputed
+
+
+def test_a_charge_is_not_disputed_unless_stripe_says_so():
+    payments, _ = payments_for([charge_json("ch_1")])
+    charge = payments.latest_charge("a@b.com")
+    assert charge is not None and not charge.disputed
+
+
+# ------------------------------------------------------- the demo backdate
+
+
+def test_a_demo_backdate_ages_the_payment():
+    """Stripe stamps `created` itself and a test clock backdates the customer
+    but not their charges, so the age check could not otherwise be shown at all.
+    The fiction lives in the data; refund_decision still just compares two
+    timestamps."""
+    payments, _ = payments_for(
+        [charge_json("ch_1", metadata={"demo_backdate_days": "45"})]
+    )
+    charge = payments.latest_charge("a@b.com")
+    assert charge is not None
+    assert int(charge.created.timestamp()) == NOW_TS - 45 * 86_400
+
+
+def test_a_charge_without_the_marker_is_untouched():
+    payments, _ = payments_for([charge_json("ch_1")])
+    charge = payments.latest_charge("a@b.com")
+    assert charge is not None and int(charge.created.timestamp()) == NOW_TS
+
+
+def test_a_nonsense_backdate_is_ignored_rather_than_crashing():
+    payments, _ = payments_for(
+        [charge_json("ch_1", metadata={"demo_backdate_days": "soon"})]
+    )
+    charge = payments.latest_charge("a@b.com")
+    assert charge is not None and int(charge.created.timestamp()) == NOW_TS
 
 
 # ----------------------------------------------------------------- refunds

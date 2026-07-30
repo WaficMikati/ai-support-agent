@@ -163,6 +163,25 @@ def test_previous_refunds_flag_the_customer():
     assert "previous refund" in decision.reason
 
 
+def test_disputed_charge_is_never_auto_refunded():
+    """Refunding on top of a dispute pays twice: the amount is already held, and
+    the card network decides the case, not us."""
+    decision = refund_decision(charge(disputed=True), 0.95, now=NOW)
+    assert not decision.auto_approve
+    assert decision.code == "disputed"
+
+
+def test_a_dispute_outranks_an_existing_refund():
+    """A charge can be both. The dispute is the more serious thing to report."""
+    both = charge(disputed=True, refunded=True)
+    assert refund_decision(both, 0.95, now=NOW).code == "disputed"
+
+
+def test_a_small_recent_disputed_charge_is_still_held():
+    """It passes every other check, so nothing but the dispute stops it."""
+    assert not refund_decision(charge(disputed=True), 1.0, now=NOW).auto_approve
+
+
 def test_already_refunded_charge_is_flagged():
     decision = refund_decision(charge(refunded=True), 0.95, now=NOW)
     assert not decision.auto_approve
@@ -304,6 +323,7 @@ def test_each_reason_for_holding_gets_its_own_explanation():
             "older than I am able to refund",
         ),
         "prior_refunds": (charge(prior_refund_count=1), "earlier refunds"),
+        "disputed": (charge(disputed=True), "disputed with your bank"),
         "no_charge": (None, "couldn't find any payments"),
     }
     for name, (on_file, expected) in cases.items():

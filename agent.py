@@ -179,6 +179,11 @@ class Charge:
     created: datetime
     refunded: bool  # any refund at all, full or partial
     prior_refund_count: int
+    # The customer has already gone to their bank about this one. Refunding on
+    # top of a dispute is how you pay twice: the disputed amount is held by
+    # Stripe already, and the case is decided by the card network rather than by
+    # us. Always a person's call, whatever the amount.
+    disputed: bool = False
     # Other charges on the same customer that could equally be the one they
     # mean. Customers rarely say which payment they are talking about, so more
     # than one candidate is treated as a question for a human, not a guess.
@@ -298,6 +303,13 @@ def refund_decision(
             False,
             f"rubric score {confidence:.2f} below {MIN_CONFIDENCE}",
             "unclear_request",
+        )
+
+    # Before the refunded check: a charge can be both, and this is the more
+    # serious of the two to report.
+    if charge.disputed:
+        return Decision(
+            False, f"charge {charge.id} is disputed with the card issuer", "disputed"
         )
 
     if charge.refunded:
@@ -423,6 +435,10 @@ ESCALATION_NOTICE = (
 HELD_EXPLANATIONS: dict[str, str] = {
     "no_charge": "I'm sorry, I couldn't find any payments on this account.",
     "already_refunded": "It looks like that payment has already been refunded.",
+    "disputed": (
+        "That payment is already being disputed with your bank, so a colleague "
+        "needs to handle it from here."
+    ),
     "ambiguous": (
         "There is more than one payment on your account, so I would rather not "
         "guess which one you mean."
@@ -1150,11 +1166,34 @@ class StripePayments:
         return Charge(
             id=target["id"],
             amount_cents=target["amount"],
-            created=datetime.fromtimestamp(target["created"], tz=timezone.utc),
+            created=self._created(target),
             refunded=self._has_any_refund(target),
             prior_refund_count=prior_refund_count - (0 if untouched else 1),
             sibling_unrefunded_count=siblings,
+            disputed=bool(target.get("disputed")),
         )
+
+    @staticmethod
+    def _created(entry: dict) -> datetime:
+        """When the payment was made, honouring a demo backdate if one is set.
+
+        Stripe stamps `created` itself and will not accept one, and a test clock
+        backdates the customer but not their charges, so there is no way to make
+        a genuinely old test payment. Without this the age check is the one rule
+        that cannot be demonstrated, only described.
+
+        Reading it from the charge's own metadata keeps the fiction in the data
+        rather than in the policy: `refund_decision` still just compares two
+        timestamps and has no idea a demo is happening. Safe by construction,
+        because the agent refuses to start against anything but a Stripe test
+        key, so this can never see a real payment.
+        """
+        made = datetime.fromtimestamp(entry["created"], tz=timezone.utc)
+        backdate = (entry.get("metadata") or {}).get("demo_backdate_days")
+        try:
+            return made - timedelta(days=float(backdate))
+        except (TypeError, ValueError):
+            return made
 
     def refund(self, charge_id: str, idempotency_key: str) -> str:
         response = self._client.post(
