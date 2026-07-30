@@ -46,6 +46,17 @@
 
     var CUSTOMER = { email: "demo@example.com", name: "Demo Customer" };
 
+    // Report who we came back as, after a reset reloads the page.
+    (function () {
+      var afterReset = sessionStorage.getItem("demoResetEmail");
+      if (afterReset) {
+        sessionStorage.removeItem("demoResetEmail");
+        document.getElementById("reset-note").textContent =
+          "Fresh conversation as " + afterReset +
+          ", with a refundable payment. Open the chat bubble.";
+      }
+    })();
+
     // Tell the widget who the visitor is, the way a real site would for a
     // signed-in customer. Two reasons this matters rather than leaving them
     // anonymous: Chatwoot stops interrupting the conversation to ask for an
@@ -74,10 +85,15 @@
             email: body.email,
             name: body.name,
           });
-          button.disabled = false;
-          note.textContent =
-            "Fresh conversation as " + body.email +
-            ", with a refundable payment. Open the chat bubble.";
+          // The reload is required, not cosmetic. setUser swaps the identity
+          // but the widget's websocket stays subscribed to the previous one, so
+          // messages still send while replies are published to a channel this
+          // page is no longer listening on: the visitor sees silence while the
+          // agent thinks it answered. Reloading re-subscribes as the new
+          // customer, whose identity is already in the cookie by now.
+          sessionStorage.setItem("demoResetEmail", body.email);
+          note.textContent = "Fresh conversation ready, reloading…";
+          location.reload();
         })
         .catch(function (error) {
           button.disabled = false;

@@ -232,8 +232,12 @@ four things do not work:
   up anonymous
 
 So the button asks the server to mint a whole new customer with its own
-refundable charge, and identifies as them. The Stripe key stays in the server
-process rather than being handed to the browser.
+refundable charge, identifies as them, and then **reloads**. The reload is
+required rather than cosmetic: `setUser` swaps the identity but the widget's
+websocket stays subscribed to the previous one, so messages still send while
+replies are published to a channel the page is no longer listening on. The
+visitor sees silence while the agent believes it answered. The Stripe key stays
+in the server process rather than being handed to the browser.
 
 ## Tests
 
