@@ -28,10 +28,9 @@
   a refund. The visitor is identified as <em>demo@example.com</em>, who has a
   refundable payment.</div>
 
-  <p id="reset-note">To start over, open this page in a private window, or run
-  <code>uv run python scripts/reset_demo.py</code>. A refresh will not do it:
-  the widget keeps the visitor in a signed token that the page itself cannot
-  clear, because the chat runs in an iframe on its own origin.</p>
+  <button class="reset" id="reset">Start a fresh conversation</button>
+  <p id="reset-note">A plain refresh resumes the same conversation, so use this
+  between demo runs.</p>
 
   <script>
     (function (d, t) {
@@ -45,16 +44,47 @@
       };
     })(document, "script");
 
+    var CUSTOMER = { email: "demo@example.com", name: "Demo Customer" };
+
     // Tell the widget who the visitor is, the way a real site would for a
     // signed-in customer. Two reasons this matters rather than leaving them
     // anonymous: Chatwoot stops interrupting the conversation to ask for an
     // email, and the refund path has an address to match against Stripe. An
     // anonymous visitor can never be matched to a charge.
     window.addEventListener("chatwoot:ready", function () {
-      window.$chatwoot.setUser("demo-visitor", {
-        email: "demo@example.com",
-        name: "Demo Customer",
-      });
+      window.$chatwoot.setUser("demo-visitor", CUSTOMER);
+    });
+
+    // A fresh conversation means a fresh customer. $chatwoot.reset() does not
+    // clear the visitor, the cookie is out of reach because the chat is an
+    // iframe on its own origin, and deleting contacts server-side leaves this
+    // page holding a dead token. What works is asking the server for a new
+    // customer, complete with a refundable charge, and identifying as them.
+    document.getElementById("reset").addEventListener("click", function () {
+      var note = document.getElementById("reset-note");
+      var button = document.getElementById("reset");
+      button.disabled = true;
+      note.textContent = "Starting a fresh conversation…";
+
+      fetch("/reset", { method: "POST" })
+        .then(function (response) { return response.json(); })
+        .then(function (body) {
+          if (!body.ok) throw new Error(body.error || "reset failed");
+          window.$chatwoot.setUser(body.identifier, {
+            email: body.email,
+            name: body.name,
+          });
+          button.disabled = false;
+          note.textContent =
+            "Fresh conversation as " + body.email +
+            ", with a refundable payment. Open the chat bubble.";
+        })
+        .catch(function (error) {
+          button.disabled = false;
+          note.textContent =
+            "Reset failed: " + error.message +
+            ". Is the page served by demo/serve.py?";
+        });
     });
   </script>
 </body>

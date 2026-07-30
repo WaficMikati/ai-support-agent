@@ -202,8 +202,38 @@ the inbox. Nothing in the agent changes.
 ```bash
 uv sync
 cp .env.example .env         # fill it in; agent.py reads it, nothing to export
+uv run python scripts/seed_helpcenter.py   # mock documentation to answer from
 uv run python agent.py
 ```
+
+### 4. The demo page
+
+```bash
+uv run python demo/serve.py    # then open http://localhost:8080
+```
+
+A one-file page carrying the widget snippet, which is also what a workshop
+attendee ends up with. It identifies the visitor the way a real site does for a
+signed-in customer, because an anonymous visitor has no email and the refund
+path matches customers by email.
+
+Its **Start a fresh conversation** button needs the server, which is why this is
+not `python -m http.server`. Resetting the chat is harder than it looks, and
+four things do not work:
+
+- `$chatwoot.reset()` leaves the visitor token byte for byte identical
+- deleting the cookie from the page does nothing, because the chat is an iframe
+  on its own origin and keeps its own copy
+- rotating the identifier with `setUser` does give a new conversation, but the
+  new contact cannot reuse the old email, since Chatwoot allows one contact per
+  email per account, and without an email refunds stop matching
+- deleting the contacts frees the email, but then the page holds a token
+  pointing at a deleted contact, `setUser` fails silently, and the visitor ends
+  up anonymous
+
+So the button asks the server to mint a whole new customer with its own
+refundable charge, and identifies as them. The Stripe key stays in the server
+process rather than being handed to the browser.
 
 ## Tests
 
