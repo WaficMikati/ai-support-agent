@@ -39,6 +39,37 @@ import reset_demo  # noqa: E402
 PORT = 8080
 
 
+def clear_queue(config: dict[str, str]) -> int:
+    """Resolve every open conversation, and report how many.
+
+    Resolved rather than deleted: the history stays visible in the Chatwoot
+    dashboard, which is worth showing, and deleting contacts would be slower
+    for no gain. What matters is that the queue is empty, because every open
+    conversation is one the agent reconsiders on each poll.
+
+    Done over the API rather than through rails runner, which takes several
+    seconds to boot and would make the button feel broken.
+    """
+    client = httpx.Client(
+        base_url=f"{config['CHATWOOT_URL']}/api/v1/accounts/{config['CHATWOOT_ACCOUNT_ID']}",
+        headers={"api_access_token": config["CHATWOOT_TOKEN"]},
+        timeout=20,
+    )
+    listing = client.get("/conversations", params={"status": "open"})
+    listing.raise_for_status()
+    body = listing.json()
+    rows = body.get("data", body).get("payload", [])
+
+    cleared = 0
+    for row in rows:
+        response = client.post(
+            f"/conversations/{row['id']}/toggle_status", json={"status": "resolved"}
+        )
+        if response.status_code < 300:
+            cleared += 1
+    return cleared
+
+
 def new_customer() -> dict[str, str]:
     """Provision a brand new customer for a fresh conversation.
 
@@ -92,7 +123,8 @@ class DemoHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            body = {"ok": True, **new_customer()}
+            cleared = clear_queue(reset_demo.settings())
+            body = {"ok": True, "cleared": cleared, **new_customer()}
         except Exception as error:  # the page should show what went wrong
             body = {"ok": False, "error": f"{type(error).__name__}: {error}"}
 

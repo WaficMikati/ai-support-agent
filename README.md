@@ -261,8 +261,12 @@ four things do not work:
   pointing at a deleted contact, `setUser` fails silently, and the visitor ends
   up anonymous
 
-So the button asks the server to mint a whole new customer with its own
-refundable charge, identifies as them, and then **reloads**. The reload is
+So the button asks the server to resolve every open conversation, mint a whole
+new customer with its own refundable charge, identify as them, and then
+**reload**. Clearing the queue matters for more than tidiness: held refunds stay
+open by design and every open conversation is one the agent reconsiders on each
+poll. They are resolved rather than deleted, so the history stays visible in the
+dashboard. The reload is
 required rather than cosmetic: `setUser` swaps the identity but the widget's
 websocket stays subscribed to the previous one, so messages still send while
 replies are published to a channel the page is no longer listening on. The

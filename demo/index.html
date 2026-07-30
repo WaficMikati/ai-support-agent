@@ -72,10 +72,16 @@
     (function () {
       var afterReset = sessionStorage.getItem("demoResetEmail");
       if (afterReset) {
+        var cleared = sessionStorage.getItem("demoResetCleared") || "0";
         sessionStorage.removeItem("demoResetEmail");
+        sessionStorage.removeItem("demoResetCleared");
         document.getElementById("reset-note").textContent =
           "Fresh conversation as " + afterReset +
-          ", with a refundable payment. Open the chat bubble.";
+          ", with a refundable payment. " +
+          (cleared === "0"
+            ? "The queue was already empty."
+            : "Cleared " + cleared + " conversation(s) from the queue.") +
+          " Open the chat bubble.";
       }
     })();
 
@@ -124,6 +130,7 @@
           // makes the widget mint a brand new contact, and the ready handler
           // above claims the identity for that one instead.
           sessionStorage.setItem("demoResetEmail", body.email);
+          sessionStorage.setItem("demoResetCleared", String(body.cleared || 0));
           note.textContent = "Fresh conversation ready, reloading…";
           location.reload();
         })
