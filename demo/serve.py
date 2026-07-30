@@ -39,8 +39,15 @@ import reset_demo  # noqa: E402
 PORT = 8080
 
 
-def clear_queue(config: dict[str, str]) -> int:
-    """Resolve every open conversation, and report how many.
+def clear_queue(config: dict[str, str], email: str | None = None) -> int:
+    """Resolve open conversations, and report how many.
+
+    Scoped to one contact when an email is given, and that is what makes the
+    page safe to hand round. Clearing the whole account is right for a single
+    presenter and wrong for a room: everybody shares one Chatwoot, so an
+    unscoped reset closes strangers' conversations mid-sentence.
+
+    `scripts/reset_demo.py` still clears everything, for tidying up afterwards.
 
     Resolved rather than deleted: the history stays visible in the Chatwoot
     dashboard, which is worth showing, and deleting contacts would be slower
@@ -62,6 +69,10 @@ def clear_queue(config: dict[str, str]) -> int:
 
     cleared = 0
     for row in rows:
+        if email:
+            sender = (row.get("meta") or {}).get("sender") or {}
+            if (sender.get("email") or "").lower() != email.lower():
+                continue
         response = client.post(
             f"/conversations/{row['id']}/toggle_status", json={"status": "resolved"}
         )
@@ -236,14 +247,27 @@ class DemoHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802  (http.server naming)
-        if self.path.rstrip("/") != "/reset":
+        route = self.path.rstrip("/")
+        # /visitor provisions somebody who has never been here, /reset replaces
+        # somebody who has. The difference is only whether there is an existing
+        # conversation to close first, but it matters on a shared instance: a
+        # first arrival must not clear anything, because everything open belongs
+        # to somebody else.
+        if route not in ("/reset", "/visitor"):
             self.send_error(404)
             return
 
         try:
             length = int(self.headers.get("Content-Length") or 0)
             asked = json.loads(self.rfile.read(length) or "{}") if length else {}
-            cleared = clear_queue(reset_demo.settings())
+            # Only ever this visitor's own conversations, identified by the
+            # address they were given last time. A first arrival has none.
+            mine = str(asked.get("email") or "").strip()
+            cleared = (
+                clear_queue(reset_demo.settings(), email=mine)
+                if route == "/reset" and mine
+                else 0
+            )
             body = {
                 "ok": True,
                 "cleared": cleared,
@@ -262,7 +286,7 @@ class DemoHandler(SimpleHTTPRequestHandler):
         self.send_response(200 if body["ok"] else 500)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        if body["ok"]:
+        if body["ok"] and route == "/reset":
             # Delete the widget's visitor token from here rather than from the
             # page. This is the only thing that actually starts a new
             # conversation: setUser creates the new contact server-side but does
@@ -272,6 +296,10 @@ class DemoHandler(SimpleHTTPRequestHandler):
             #
             # Cookies ignore the port, so clearing it for host "localhost" from
             # :8080 also clears the one the widget set from :3000.
+            #
+            # Only on /reset. A first arrival is already holding a token the
+            # widget minted moments ago, and clearing it would orphan the
+            # contact it belongs to before setUser has claimed it.
             self.send_header(
                 "Set-Cookie",
                 "cw_conversation=; Max-Age=0; Path=/; SameSite=Lax",
