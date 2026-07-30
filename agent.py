@@ -419,7 +419,7 @@ def needs_reply(conversation: Conversation) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Handling one conversation
+# The graph: what carries state, the nodes, the edges, and the walk
 # --------------------------------------------------------------------------
 
 
@@ -1008,7 +1008,7 @@ class StripePayments:
 
 
 # --------------------------------------------------------------------------
-# Groq
+# The model. Any OpenAI-shaped endpoint; the name is set in .env.
 # --------------------------------------------------------------------------
 
 PROPOSAL_SCHEMA = {
