@@ -292,7 +292,13 @@ def test_the_node_offers_the_lookup_to_the_model():
 def test_a_payment_is_described_in_plain_words():
     said = describe_charge(charge())
     assert "20.00" in said and "30 July 2026" in said
-    assert "not been refunded" in said
+
+
+def test_a_payment_that_stands_says_nothing_about_refunds():
+    """Told a payment "has not been refunded" the model repeats it, so somebody
+    who asked what they had paid is answered with a refund status they never
+    raised. Whether a refund can happen is settled in code regardless."""
+    assert "refund" not in describe_charge(charge()).lower()
 
 
 def test_an_already_refunded_payment_says_so():

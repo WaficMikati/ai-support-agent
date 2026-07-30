@@ -559,11 +559,13 @@ def describe_charge(charge: Charge | None) -> str:
         f"Most recent payment: {charge.amount_cents / 100:.2f} "
         f"on {charge.created:%d %B %Y}."
     ]
-    said.append(
-        "It has already been refunded."
-        if charge.refunded
-        else "It has not been refunded."
-    )
+    # Only worth saying when it is true. Told a payment "has not been refunded"
+    # the model repeats it, so somebody who asked what they had paid was
+    # answered with a refund status they never raised, which reads like the
+    # agent bracing for an argument. Whether a refund can happen is settled in
+    # code regardless, so nothing downstream needs this line.
+    if charge.refunded:
+        said.append("It has already been refunded.")
     if charge.sibling_unrefunded_count:
         said.append(
             f"There are {charge.sibling_unrefunded_count} other unrefunded "
@@ -1254,6 +1256,9 @@ TOOL_GUIDANCE = """You can look things up before answering.
 Call a tool when the customer asks about their own account rather than about
 the product in general. Do not ask them for details a tool can give you, and
 do not ask them to confirm who they are: they are signed in.
+
+What a lookup returns is for you to read, not to recite. Answer the question they
+asked, in your own words, and leave out anything they did not ask about.
 
 If a lookup comes back empty, that is an answer, not a failure. Say there is
 nothing on the account. Do not say you cannot see it or do not have it, which is
