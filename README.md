@@ -94,12 +94,19 @@ subscription, so the workshop has documentation to answer from that cannot be
 mistaken for anyone's real policy. Point `HELP_CENTRE_PORTAL` at a different
 portal to use real documentation instead; no code changes.
 
-**Keep the inbox tidy, it is a latency issue.** Each poll fetches the messages
-of every open conversation, so a cluttered inbox costs a round trip per
-conversation before the agent even reaches the new message. Measured on this
-setup: with eight stale open conversations a reply took 3.6 to 4.6 seconds, and
-with none it took 1.5 to 2.5 seconds, for about one second of actual model work.
-`scripts/reset_demo.py` before a demo is a speed fix, not just tidying.
+**The poll costs one request, not one per conversation.** The conversation list
+already carries the newest message, which is all the loop needs to know who
+spoke last, so the messages of each conversation are fetched only when that
+newest entry is one of Chatwoot's own activity or template records and the loop
+has to look further back.
+
+This matters because refunds held for a human stay open by design, so that queue
+only grows. Fetching per conversation made the agent slower the longer people
+were behind: measured here, eight held refunds took a reply from about 2 seconds
+to 3.6 to 4.6 seconds. With the list-first approach, ten held refunds in the
+queue still reply in 1.4 to 2.9 seconds, of which about one second is the model.
+Across 43 polls with ten open conversations it made four message fetches; the
+per-conversation version would have made about 430.
 
 **Temperature is pinned to 0.** Both jobs want the most likely answer rather
 than a creative one, and this is not cosmetic: left at the provider default,

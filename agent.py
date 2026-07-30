@@ -498,32 +498,57 @@ class ChatwootInbox:
         response = self._client.get("/conversations", params={"status": "open"})
         response.raise_for_status()
         payload = response.json()["data"]["payload"]
-        return [self._conversation(entry["id"], entry) for entry in payload]
+        return [self._conversation(entry) for entry in payload]
 
-    def _conversation(self, conversation_id: int, entry: dict) -> Conversation:
-        response = self._client.get(f"/conversations/{conversation_id}/messages")
-        response.raise_for_status()
+    @staticmethod
+    def _message(item: dict) -> Message:
         # message_type: 0 incoming, 1 outgoing, 2 activity, 3 template.
         # Private notes are kept. They are how we mark that a refund has
         # already been handed to a human, so dropping them here would make
         # the agent flag the same conversation on every single poll.
-        messages = tuple(
-            Message(
-                id=item["id"],
-                content=item.get("content") or "",
-                incoming=item.get("message_type") == 0,
-                private=bool(item.get("private")),
-                activity=item.get("message_type") == 2,
-                template=item.get("message_type") == 3,
-            )
-            for item in response.json()["payload"]
+        return Message(
+            id=item["id"],
+            content=item.get("content") or "",
+            incoming=item.get("message_type") == 0,
+            private=bool(item.get("private")),
+            activity=item.get("message_type") == 2,
+            template=item.get("message_type") == 3,
         )
+
+    def _conversation(self, entry: dict) -> Conversation:
+        """One conversation, fetching its messages only when it has to.
+
+        The list response already carries the newest message, and that is all
+        the loop needs: who spoke last. Fetching the full thread per
+        conversation made the poll cost one request per open conversation, so
+        the agent got measurably slower as the queue of refunds awaiting a human
+        grew, and those conversations stay open by design.
+
+        The fallback matters though. Chatwoot files its own entries as messages,
+        and if the newest one is an activity or a template we cannot tell who
+        spoke last without looking further back.
+        """
+        conversation_id = entry["id"]
         contact = (entry.get("meta") or {}).get("sender") or {}
+        newest = [
+            self._message(item)
+            for item in (entry.get("messages") or [])
+            if isinstance(item, dict) and "id" in item
+        ]
+
+        usable = bool(newest) and not (newest[-1].activity or newest[-1].template)
+        messages = tuple(newest) if usable else self._all_messages(conversation_id)
+
         return Conversation(
             id=conversation_id,
             contact_email=contact.get("email"),
             messages=messages,
         )
+
+    def _all_messages(self, conversation_id: int) -> tuple[Message, ...]:
+        response = self._client.get(f"/conversations/{conversation_id}/messages")
+        response.raise_for_status()
+        return tuple(self._message(item) for item in response.json()["payload"])
 
     def send_reply(self, conversation_id: int, content: str) -> None:
         self._post(conversation_id, content, private=False)

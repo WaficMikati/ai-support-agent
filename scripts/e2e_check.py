@@ -17,6 +17,7 @@ needs. Fixture setup therefore uses the sandbox's ordinary secret key
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -175,7 +176,35 @@ class ChatwootAdmin:
 # --------------------------------------------------------------------- run
 
 
+def agent_already_running() -> bool:
+    """True if a polling agent is up.
+
+    This script drives handle_conversation itself, so a running agent handles
+    the same conversations in parallel and every assertion about "one reply" or
+    "one note" fails. Worth refusing outright: the failure otherwise looks like
+    a bug in the agent rather than two processes doing the same work. The money
+    stays safe either way, because the Stripe idempotency key catches it, which
+    is exactly what that key is for.
+    """
+    try:
+        found = subprocess.run(
+            ["pgrep", "-f", "python agent.py"], capture_output=True, text=True, timeout=10
+        )
+        return found.returncode == 0 and bool(found.stdout.strip())
+    except Exception:
+        return False
+
+
 def main() -> int:
+    if agent_already_running() and "--allow-agent" not in sys.argv:
+        print(
+            "REFUSING TO RUN: agent.py is polling.\n"
+            "  It would handle these conversations too, so every assertion about\n"
+            "  a single reply or a single note would fail. Stop the agent, or pass\n"
+            "  --allow-agent if you know what you are looking at."
+        )
+        return 1
+
     env = load_env()
     local = load_local("admin.local.txt")
 
