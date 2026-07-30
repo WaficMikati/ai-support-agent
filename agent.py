@@ -382,13 +382,22 @@ def _handle_refund(
     decision = refund_decision(charge, result.confidence, now=now)
 
     if not decision.auto_approve:
-        # Deliberately left open: a person still has to act on it.
+        # Tell the customer something, then tell the team why. Posting only the
+        # note leaves the customer staring at silence, which is indistinguishable
+        # from a broken agent: they asked for a refund and nothing came back. The
+        # acknowledgement deliberately says nothing about the outcome, since
+        # whether to refund is the human's decision, not ours.
+        inbox.send_reply(
+            conversation.id,
+            "Thanks for getting in touch. I've passed this to a colleague who "
+            "will look at your refund and come back to you shortly.",
+        )
+        # Deliberately left open, and not resolved: a person still has to act.
         inbox.add_private_note(
             conversation.id,
             "Refund request held for review.\n"
             f"Reason: {decision.reason}\n\n"
-            "Suggested reply: Thanks for getting in touch, we're looking at "
-            "your refund now and will come back to you shortly.",
+            "The customer has been told a colleague will follow up.",
         )
         return "flagged"
 

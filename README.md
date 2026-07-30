@@ -110,8 +110,13 @@ Auto-approval requires **all** of:
 | Charge not already refunded, in full or in part | — |
 | Exactly one refundable charge, so there is nothing to guess | — |
 
-Anything else posts a private note with the reason and a suggested reply,
-leaves the conversation open, and touches no money.
+Anything else tells the customer a colleague will follow up, posts a private
+note with the reason, leaves the conversation open, and touches no money. The
+customer-facing acknowledgement matters: posting only the note leaves them
+staring at silence, which is indistinguishable from a broken agent, and it is
+the single most confusing thing to hit while demonstrating this. The
+acknowledgement deliberately says nothing about the outcome, because whether to
+refund is the human's decision.
 
 Two details that are easy to get wrong. Stripe sets `refunded` only when a
 charge is refunded *in full*, so a partly refunded charge looks untouched;

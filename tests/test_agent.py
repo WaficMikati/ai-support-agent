@@ -231,9 +231,40 @@ def test_oversized_refund_is_held_and_never_charges_stripe():
     )
     assert action == "flagged"
     assert payments.refunded == []
-    assert inbox.replies == []
     assert len(inbox.notes) == 1
     assert "limit" in inbox.notes[0][1]
+
+
+def test_a_held_refund_still_tells_the_customer_something():
+    """Silence is indistinguishable from a broken agent: they asked for a refund
+    and nothing came back."""
+    payments = FakePayments(charge(amount_cents=90_000))
+    action, inbox, _ = run(
+        conversation("refund please"), payments=payments, intent="refund"
+    )
+    assert action == "flagged"
+    assert len(inbox.replies) == 1, "the customer must not be left in silence"
+    assert "colleague" in inbox.replies[0][1]
+
+
+def test_the_acknowledgement_does_not_promise_a_refund():
+    """Whether to refund is the human's decision, so the holding message must
+    not imply the answer."""
+    payments = FakePayments(charge(amount_cents=90_000))
+    _, inbox, _ = run(
+        conversation("refund please"), payments=payments, intent="refund"
+    )
+    said = inbox.replies[0][1].lower()
+    assert "refunded" not in said
+    assert "on its way back" not in said
+
+
+def test_a_held_refund_is_not_resolved():
+    payments = FakePayments(charge(amount_cents=90_000))
+    _, inbox, _ = run(
+        conversation("refund please"), payments=payments, intent="refund"
+    )
+    assert inbox.resolved == [], "a person still has to act on it"
 
 
 def test_refund_with_no_matching_customer_is_held():
@@ -292,10 +323,13 @@ def test_held_refund_stays_open_for_a_human():
     assert inbox.resolved == [], "a human still has to act on it"
 
 
-def test_held_refund_note_carries_a_suggested_reply():
+def test_the_note_records_why_and_that_the_customer_was_told():
     payments = FakePayments(charge(amount_cents=90_000))
     _, inbox, _ = run(conversation("refund"), payments=payments, intent="refund")
-    assert "Suggested reply" in inbox.notes[0][1]
+    note = inbox.notes[0][1]
+    assert "held for review" in note
+    assert "limit" in note, "the reason must be in the note"
+    assert "colleague will follow up" in note
 
 
 @pytest.mark.parametrize("intent", ["support", "refund"])
