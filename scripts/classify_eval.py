@@ -57,6 +57,7 @@ CASES: list[tuple[str, str]] = [
     ("refund me", "refund"),
     ("this bag was stale, I want a refund", "refund"),
     ("I was charged twice, please send one back", "refund"),
+    ("my order arrived damaged, I want my money back", "refund"),
     ("i need a refund", "refund"),
     ("Can you refund the payment from last week?", "refund"),
     ("I'd like a refund for this month please", "refund"),
@@ -68,6 +69,8 @@ CASES: list[tuple[str, str]] = [
     ("are refunds possible after a month?", "support"),
     ("how long do refunds take?", "support"),
     ("if my coffee arrives stale can I get my money back?", "support"),
+    ("if I cancel today do I get this month back?", "support"),
+    ("would I be refunded if the delivery never turns up?", "support"),
     # Ordinary support.
     ("can I skip a month?", "support"),
     ("do you have decaf?", "support"),
