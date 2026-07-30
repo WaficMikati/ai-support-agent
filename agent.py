@@ -621,7 +621,11 @@ class Brain:
     """
 
     DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
-    DEFAULT_MODEL = "openai/gpt-oss-20b:free"
+    # Free, and fast enough to feel immediate: about a second to classify and
+    # two to write an answer, served by Nvidia directly. The obvious pick,
+    # openai/gpt-oss-20b:free, has a single provider that took seconds to
+    # minutes and generated JSON by instruction rather than enforcing it.
+    DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"
     # Both jobs here want the most likely answer, not a creative one. Left at
     # the provider default, which is usually 1.0, a small model occasionally
     # drops a stray token into an otherwise fine sentence, and the classifier's
@@ -635,11 +639,19 @@ class Brain:
         base_url: str = DEFAULT_BASE_URL,
         provider_order: tuple[str, ...] = (),
         temperature: float = DEFAULT_TEMPERATURE,
+        require_schema: bool = False,
         transport: httpx.BaseTransport | None = None,
         sleep=time.sleep,
     ):
         self._model = model
         self._temperature = temperature
+        # Asking OpenRouter to route only to endpoints advertising structured
+        # output sounds prudent, but it narrows the free catalogue from fourteen
+        # models to four, and the endpoints it does allow may still not enforce
+        # the schema. What actually guarantees a usable answer here is the
+        # prompt stating the contract, plus validation and a retry. Off by
+        # default so any model can be used; turn it on to insist.
+        self._require_schema = require_schema
         self._sleep = sleep
         # `provider` is an OpenRouter extension. Sending it to a plain
         # OpenAI-shaped endpoint like Groq risks a rejected request, so it only
@@ -678,7 +690,7 @@ class Brain:
                     {"role": "user", "content": message},
                 ],
                 response_format={"type": "json_schema", "json_schema": CLASSIFY_SCHEMA},
-                **self._provider_preferences(require_parameters=True),
+                **self._provider_preferences(require_parameters=self._require_schema),
             )
             classification = self._parse(last_payload)
             if classification is not None:
@@ -820,6 +832,8 @@ def main() -> None:
         temperature=float(
             os.environ.get("MODEL_TEMPERATURE", Brain.DEFAULT_TEMPERATURE)
         ),
+        require_schema=os.environ.get("MODEL_REQUIRE_SCHEMA", "").lower()
+        in ("1", "true", "yes"),
     )
 
     interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))

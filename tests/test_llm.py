@@ -44,10 +44,10 @@ def test_classification_asks_for_a_strict_schema():
     brain, seen, _ = brain_for([(200, completion('{"intent":"refund","confidence":0.9}'))])
     brain.classify("I want my money back")
     body = json.loads(seen[0].content)
-    assert body["model"] == "openai/gpt-oss-20b:free"
+    assert body["model"] == "nvidia/nemotron-3-nano-30b-a3b:free"
     fmt = body["response_format"]
     assert fmt["type"] == "json_schema"
-    assert fmt["json_schema"]["strict"] is True, "strict mode is why this model was picked"
+    assert fmt["json_schema"]["strict"] is True, "sent as a hint; honoured only by some endpoints"
     schema = fmt["json_schema"]["schema"]
     assert schema["properties"]["intent"]["enum"] == ["refund", "support"]
     assert schema["additionalProperties"] is False
@@ -109,8 +109,29 @@ def test_a_custom_model_is_honoured():
 # --------------------------------------------------------- provider routing
 
 
-def test_classification_asks_openrouter_not_to_route_around_the_schema():
+def test_by_default_no_provider_constraints_are_sent():
+    """Requiring advertised schema support narrows the free catalogue from
+    fourteen models to four, and does not actually guarantee enforcement."""
     brain, seen, _ = brain_for([(200, completion('{"intent":"refund","confidence":0.9}'))])
+    brain.classify("money back")
+    assert "provider" not in json.loads(seen[0].content)
+
+
+def test_schema_support_can_be_insisted_on():
+    seen: list[httpx.Request] = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(
+            200, json=completion('{"intent":"refund","confidence":0.9}')
+        )
+
+    brain = Brain(
+        "gsk_test",
+        require_schema=True,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _s: None,
+    )
     brain.classify("money back")
     assert json.loads(seen[0].content)["provider"]["require_parameters"] is True
 
@@ -141,7 +162,7 @@ def test_a_pinned_provider_refuses_fallbacks():
     provider = json.loads(seen[0].content)["provider"]
     assert provider["order"] == ["Groq", "Fireworks"]
     assert provider["allow_fallbacks"] is False
-    assert provider["require_parameters"] is True
+    assert "require_parameters" not in provider, "pinning is independent of insisting"
 
 
 def test_pinning_also_applies_when_writing_an_answer():
