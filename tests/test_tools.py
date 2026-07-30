@@ -305,7 +305,7 @@ def test_other_payments_are_mentioned_because_they_block_a_refund():
 
 
 def test_no_payment_is_stated_plainly_rather_than_left_blank():
-    assert "No payment" in describe_charge(None)
+    assert "no payments on record" in describe_charge(None)
 
 
 def test_the_charge_id_is_never_shown():

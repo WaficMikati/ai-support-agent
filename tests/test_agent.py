@@ -285,6 +285,27 @@ def test_a_held_refund_keeps_the_reply_the_model_wrote():
     assert inbox.replies[0][1].startswith("I have cancelled your subscription.")
 
 
+def test_a_refund_on_an_empty_account_says_there_is_nothing_there():
+    """Code knows this and the model does not: asked for a refund it often never
+    looks, and asking for a date it cannot use reads badly next to a message
+    saying the request has already been passed on."""
+    inbox = FakeInbox()
+    handle_conversation(
+        conversation("refund me"),
+        inbox=inbox,
+        payments=FakePayments(None),
+        understand=understander(
+            "refund", text="Could you tell me the date of the payment?"
+        ),
+        knowledge="guidance",
+        now=NOW,
+    )
+    reply = inbox.replies[0][1]
+    assert "couldn't find any payments" in reply
+    assert "date of the payment" not in reply, "the useless question is dropped"
+    assert "within the next 24 hours" in reply
+
+
 def test_a_held_refund_always_says_what_happens_next():
     """The customer is owed the same commitment every time, so it is written
     here rather than left to whatever the model happened to say."""

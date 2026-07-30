@@ -393,6 +393,15 @@ ESCALATION_NOTICE = (
     "receive an email within the next 24 hours."
 )
 
+# Said instead of the model's reply, not after it, when a refund is asked for on
+# an account with nothing on it. Code knows this for certain and the model
+# usually does not: asked for a refund it often never looks, and when it does
+# look it tends to report that it cannot see the payment rather than that there
+# is not one. Either way it ends up asking for a date or an amount that would
+# not help, which reads badly next to a message saying the request has already
+# been passed on.
+NO_PAYMENT_REPLY = "I'm sorry, I couldn't find any payments on this account."
+
 # Phrases that would tell a customer their money is on the way. Deliberately
 # blunt: this only has to catch a model that ignored the instruction not to
 # promise an outcome, and a false positive costs nothing but a plainer reply.
@@ -417,14 +426,21 @@ def safe_holding_reply(reply: str) -> str:
     return reply
 
 
-def held_reply(reply: str) -> str:
+def held_reply(reply: str, *, charge_found: bool = True) -> str:
     """What the customer is told when a person has to decide.
 
     The model's own words first, so anything else they asked is still answered,
     then the one sentence that must always be there. Guaranteed rather than
     hoped for: the model was told not to promise an outcome, and this is what
     the customer is owed instead.
+
+    With nothing on the account the model's words are dropped rather than kept.
+    It is the one case where code is better informed than the model, and where
+    what the model tends to write, a request for a date or an amount, actively
+    contradicts the sentence that follows it.
     """
+    if not charge_found:
+        return f"{NO_PAYMENT_REPLY}\n\n{ESCALATION_NOTICE}"
     return f"{safe_holding_reply(reply).rstrip()}\n\n{ESCALATION_NOTICE}"
 
 
@@ -500,7 +516,11 @@ def describe_charge(charge: Charge | None) -> str:
     put in front of the model can end up quoted back to them.
     """
     if charge is None:
-        return "No payment was found for this customer."
+        # Phrased as a fact rather than as a failed search. "No payment was
+        # found" reads to the model like the lookup broke, and it then tells the
+        # customer it does not have the information, which is the opposite of
+        # what it just learned.
+        return "This account has no payments on record. There is nothing to show."
 
     said = [
         f"Most recent payment: {charge.amount_cents / 100:.2f} "
@@ -625,7 +645,8 @@ def hold_node(state: State) -> State:
     # safe wording replaces it: the customer must not be told their money is
     # coming back when a human has not agreed to it.
     state.inbox.send_reply(
-        state.conversation.id, held_reply(state.proposal.reply)
+        state.conversation.id,
+        held_reply(state.proposal.reply, charge_found=state.charge is not None),
     )
     # Deliberately left open, and not resolved: a person still has to act.
     state.inbox.add_private_note(
@@ -1200,6 +1221,11 @@ TOOL_GUIDANCE = """You can look things up before answering.
 Call a tool when the customer asks about their own account rather than about
 the product in general. Do not ask them for details a tool can give you, and
 do not ask them to confirm who they are: they are signed in.
+
+If a lookup comes back empty, that is an answer, not a failure. Say there is
+nothing on the account. Do not say you cannot see it or do not have it, which is
+not true once you have looked, and do not then ask them for details you have
+just looked up yourself.
 
 When you have what you need, stop calling tools."""
 
