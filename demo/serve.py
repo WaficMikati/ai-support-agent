@@ -85,7 +85,11 @@ DISPUTE_SOURCE = "tok_createDispute"
 
 
 def new_customer(
-    amount_cents: int = 0, history: str = "clean", backdate_days: int = 0
+    amount_cents: int = 0,
+    history: str = "clean",
+    backdate_days: int = 0,
+    amount_cents_2: int = 0,
+    backdate_days_2: int = 0,
 ) -> dict[str, str]:
     """Provision a brand new customer for a fresh conversation.
 
@@ -121,18 +125,19 @@ def new_customer(
         customer.raise_for_status()
         customer_id = customer.json()["id"]
 
-        def charge_for(cents: int, description: str) -> str:
+        def charge_for(cents: int, description: str, aged: int = -1) -> str:
+            days = backdate_days if aged < 0 else aged
             data = {
                 "amount": cents,
                 "currency": "usd",
                 "customer": customer_id,
                 "description": description,
             }
-            if backdate_days:
+            if days:
                 # Stripe stamps `created` itself and a test clock backdates the
                 # customer but not their charges, so the age is carried in
                 # metadata and applied when the charge is read back.
-                data["metadata[demo_backdate_days]"] = str(backdate_days)
+                data["metadata[demo_backdate_days]"] = str(days)
             made = client.post("/charges", data=data)
             made.raise_for_status()
             return made.json()["id"]
@@ -156,8 +161,20 @@ def new_customer(
             charge_for(amount, "demo subscription payment")
         elif history == "multiple":
             # Two candidates, so the policy refuses to guess which is meant.
-            charge_for(amount, "demo subscription payment (first)")
-            charge_for(amount, "demo subscription payment (second)")
+            # They get their own amount and date: identical payments made the
+            # ambiguity abstract, since there was nothing to tell them apart.
+            #
+            # Created oldest first, because the backdating is metadata Stripe
+            # knows nothing about. Stripe orders charges by when they were
+            # really made, and the adapter takes the newest, so creating them
+            # out of order would hand the agent the one the page calls older.
+            second = amount_cents_2 or amount
+            pair = sorted(
+                [(backdate_days, amount), (backdate_days_2, second)],
+                key=lambda made: -made[0],
+            )
+            for index, (aged, cents) in enumerate(pair, start=1):
+                charge_for(cents, f"demo subscription payment ({index})", aged=aged)
         else:
             charge_for(amount, "demo subscription payment")
 
@@ -234,6 +251,8 @@ class DemoHandler(SimpleHTTPRequestHandler):
                     amount_cents=int(asked.get("amount_cents") or 0),
                     history=str(asked.get("history") or "clean"),
                     backdate_days=int(asked.get("backdate_days") or 0),
+                    amount_cents_2=int(asked.get("amount_cents_2") or 0),
+                    backdate_days_2=int(asked.get("backdate_days_2") or 0),
                 ),
             }
         except Exception as error:  # the page should show what went wrong

@@ -624,10 +624,12 @@ def describe_charge(charge: Charge | None) -> str:
     # code regardless, so nothing downstream needs this line.
     if charge.refunded:
         said.append("It has already been refunded.")
-    if charge.sibling_unrefunded_count:
+    others = charge.sibling_unrefunded_count
+    if others:
         said.append(
-            f"There are {charge.sibling_unrefunded_count} other unrefunded "
-            "payments on this account."
+            f"There is {others} other unrefunded payment on this account."
+            if others == 1
+            else f"There are {others} other unrefunded payments on this account."
         )
     return " ".join(said)
 

@@ -54,7 +54,7 @@
     </div>
 
     <div class="field" id="field-amount">
-      <label for="amount">Payment amount</label>
+      <label for="amount" id="label-amount">Payment amount</label>
       <select id="amount">
         <option value="2000">$20.00 — inside the auto-approval limit</option>
         <option value="9000">$90.00 — over the limit, needs a person</option>
@@ -62,10 +62,26 @@
     </div>
 
     <div class="field" id="field-age">
-      <label for="age">Payment date</label>
+      <label for="age" id="label-age">Payment date</label>
       <select id="age">
         <option value="0">Today — inside the refund window</option>
         <option value="45">45 days ago — outside the window</option>
+      </select>
+    </div>
+
+    <div class="field" id="field-amount2">
+      <label for="amount2">Second payment amount</label>
+      <select id="amount2">
+        <option value="9000">$90.00</option>
+        <option value="2000">$20.00</option>
+      </select>
+    </div>
+
+    <div class="field" id="field-age2">
+      <label for="age2">Second payment date</label>
+      <select id="age2">
+        <option value="0">Today</option>
+        <option value="45">45 days ago</option>
       </select>
     </div>
 
@@ -118,7 +134,7 @@
     // describes something else is a confusing thing to have on a screen in
     // front of a room.
     (function () {
-      ["history", "amount", "age"].forEach(function (id) {
+      ["history", "amount", "age", "amount2", "age2"].forEach(function (id) {
         var select = document.getElementById(id);
         var saved = sessionStorage.getItem("demoChoice-" + id);
         if (saved) select.value = saved;
@@ -158,8 +174,21 @@
       var ageDays = parseInt(document.getElementById("age").value, 10);
 
       var hasPayment = history !== "none";
+      // Two payments means two of everything. Giving them the same amount and
+      // the same date made "I cannot tell which one you mean" abstract: they
+      // were indistinguishable, so there was nothing for the customer to point
+      // at and nothing for the agent to be unable to choose between.
+      var twoPayments = history === "multiple";
+
       document.getElementById("field-amount").hidden = !hasPayment;
       document.getElementById("field-age").hidden = !hasPayment;
+      document.getElementById("field-amount2").hidden = !twoPayments;
+      document.getElementById("field-age2").hidden = !twoPayments;
+
+      document.getElementById("label-amount").textContent =
+        twoPayments ? "First payment amount" : "Payment amount";
+      document.getElementById("label-age").textContent =
+        twoPayments ? "First payment date" : "Payment date";
 
       var failed = firstFailure(history, amountCents, ageDays);
       document.getElementById("expected").textContent =
@@ -244,6 +273,12 @@
           backdate_days: document.getElementById("field-age").hidden
             ? 0
             : parseInt(document.getElementById("age").value, 10),
+          amount_cents_2: document.getElementById("field-amount2").hidden
+            ? 0
+            : parseInt(document.getElementById("amount2").value, 10),
+          backdate_days_2: document.getElementById("field-age2").hidden
+            ? 0
+            : parseInt(document.getElementById("age2").value, 10),
           history: document.getElementById("history").value,
         }),
       })

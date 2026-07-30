@@ -307,7 +307,15 @@ def test_an_already_refunded_payment_says_so():
 
 def test_other_payments_are_mentioned_because_they_block_a_refund():
     said = describe_charge(charge(sibling_unrefunded_count=2))
-    assert "2 other unrefunded" in said
+    assert "2 other unrefunded payments" in said
+
+
+def test_a_single_other_payment_reads_as_one():
+    """Two payments is the common case, and "1 other unrefunded payments" is
+    the sort of thing the model repeats verbatim."""
+    said = describe_charge(charge(sibling_unrefunded_count=1))
+    assert "1 other unrefunded payment on this account" in said
+    assert "payments" not in said
 
 
 def test_no_payment_is_stated_plainly_rather_than_left_blank():
