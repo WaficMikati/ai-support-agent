@@ -7,3 +7,6 @@ __pycache__/
 reload_check.log
 .playwright-cli/
 demo/__pycache__/
+
+# A local teaching deck, not part of the agent.
+presentation.html
