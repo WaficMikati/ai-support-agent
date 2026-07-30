@@ -208,8 +208,14 @@ def page_settings() -> dict[str, str]:
     dead widget until they hand-edited the file.
     """
     config = reset_demo.settings()
+    # PUBLIC_CHATWOOT_URL when the page is being shared over a tunnel. The
+    # widget's script, its iframe and its websocket are all fetched by the
+    # visitor's browser, so localhost here means *their* machine and the chat
+    # bubble simply never appears. The agent goes on using CHATWOOT_URL, which
+    # is faster and does not stop working when a tunnel does.
     return {
-        "__CHATWOOT_URL__": config.get("CHATWOOT_URL", "http://localhost:3000"),
+        "__CHATWOOT_URL__": config.get("PUBLIC_CHATWOOT_URL")
+        or config.get("CHATWOOT_URL", "http://localhost:3000"),
         "__WIDGET_TOKEN__": config.get(
             "CHATWOOT_WIDGET_TOKEN", config.get("widget_token", "")
         ),
