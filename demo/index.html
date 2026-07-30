@@ -24,8 +24,9 @@
   <p>Our support agent answers common questions straight away. Anything it is
   not sure about goes to a person.</p>
   <div class="hint">Open the chat bubble in the corner and ask something, for
-  example <em>"I can't log in and the reset email never arrives"</em>. To try a
-  refund, enter <em>demo@example.com</em> when it asks for your email.</div>
+  example <em>"I can't log in and the reset email never arrives"</em>, or ask for
+  a refund. The visitor is identified as <em>demo@example.com</em>, who has a
+  refundable payment.</div>
 
   <p id="reset-note">To start over, open this page in a private window, or run
   <code>uv run python scripts/reset_demo.py</code>. A refresh will not do it:
@@ -43,6 +44,18 @@
         window.chatwootSDK.run({ websiteToken: "RhFSY9waaN1NfZMe3ZmidenE", baseUrl: BASE_URL });
       };
     })(document, "script");
+
+    // Tell the widget who the visitor is, the way a real site would for a
+    // signed-in customer. Two reasons this matters rather than leaving them
+    // anonymous: Chatwoot stops interrupting the conversation to ask for an
+    // email, and the refund path has an address to match against Stripe. An
+    // anonymous visitor can never be matched to a charge.
+    window.addEventListener("chatwoot:ready", function () {
+      window.$chatwoot.setUser("demo-visitor", {
+        email: "demo@example.com",
+        name: "Demo Customer",
+      });
+    });
   </script>
 </body>
 </html>
