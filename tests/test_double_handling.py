@@ -27,6 +27,7 @@ class FakeInbox:
         self.replies = []
         self.notes = []
         self.resolved = []
+        self.recorded = []
 
     def open_conversations(self):
         return self.conversations
@@ -39,6 +40,9 @@ class FakeInbox:
 
     def resolve(self, conversation_id):
         self.resolved.append(conversation_id)
+
+    def record_handled(self, conversation_id, message_id):
+        self.recorded.append((conversation_id, message_id))
 
 
 class FakePayments:
@@ -66,7 +70,7 @@ class ExplodingBrain:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("model API returned 503")
-        return Proposal(reply="answer", refund_requested=False, confidence=0.99)
+        return Proposal(reply="answer", refund_requested=False, clear_request=True, charge_identified=True, hedging=False)
 
 
 def charge(**overrides) -> Charge:
@@ -100,7 +104,11 @@ def act(conv, handled, *, inbox=None, payments=None, intent="support", brain=Non
         understand=brain
         or (
             lambda turns, knowledge, articles=(): Proposal(
-                reply="answer", refund_requested=intent == "refund", confidence=0.99
+                reply="answer",
+                refund_requested=intent == "refund",
+                clear_request=True,
+                charge_identified=True,
+                hedging=False,
             )
         ),
         knowledge="guidance",
@@ -196,7 +204,11 @@ def test_the_loop_shares_one_set_across_passes():
         inbox=inbox,
         payments=FakePayments(charge()),
         understand=lambda turns, knowledge, articles=(): Proposal(
-            reply="answer", refund_requested=False, confidence=0.99
+            reply="answer",
+            refund_requested=False,
+            clear_request=True,
+            charge_identified=True,
+            hedging=False,
         ),
         knowledge="guidance",
         handled=handled,
@@ -209,25 +221,31 @@ def test_the_loop_shares_one_set_across_passes():
 # -------------------------------------------------------- idempotency key
 
 
-def test_the_key_is_derived_from_the_conversation_and_message():
-    assert refund_idempotency_key(482, 91) == "refund-conv482-msg91"
+def test_the_key_is_derived_from_the_conversation_and_charge():
+    assert refund_idempotency_key(482, "ch_abc") == "refund-conv482-ch_abc"
 
 
 def test_the_key_is_stable_for_the_same_request():
-    assert refund_idempotency_key(1, 2) == refund_idempotency_key(1, 2)
+    assert refund_idempotency_key(1, "ch_1") == refund_idempotency_key(1, "ch_1")
 
 
-def test_different_requests_get_different_keys():
+def test_asking_twice_in_one_conversation_reuses_the_key():
+    """Two messages, one charge. Keyed on the message these would differ and
+    Stripe would treat the second attempt as a fresh refund."""
+    assert refund_idempotency_key(7, "ch_1") == refund_idempotency_key(7, "ch_1")
+
+
+def test_different_charges_and_conversations_get_different_keys():
     keys = {
-        refund_idempotency_key(1, 1),
-        refund_idempotency_key(1, 2),
-        refund_idempotency_key(2, 1),
+        refund_idempotency_key(1, "ch_1"),
+        refund_idempotency_key(1, "ch_2"),
+        refund_idempotency_key(2, "ch_1"),
     }
     assert len(keys) == 3
 
 
 def test_the_key_carries_no_personal_data_and_fits_stripes_limit():
-    key = refund_idempotency_key(999_999, 999_999)
+    key = refund_idempotency_key(999_999, "ch_3TymYHKS7Y6zQSXz0FzMdd7e")
     assert "@" not in key
     assert len(key) <= 255
 
@@ -236,4 +254,4 @@ def test_the_refund_is_sent_with_the_key_for_that_message():
     handled = HandledMessages()
     payments = FakePayments(charge())
     act(conversation(message_id=91, text="refund"), handled, payments=payments, intent="refund")
-    assert payments.keys == ["refund-conv7-msg91"]
+    assert payments.keys == ["refund-conv7-ch_1"]

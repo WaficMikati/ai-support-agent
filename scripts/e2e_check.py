@@ -360,7 +360,7 @@ def main() -> int:
         # Unique per run. Stripe keeps keys for at least 24 hours and rejects a
         # reused key that arrives with different parameters, so a fixed key here
         # fails on the second run of the day against a different charge.
-        key = refund_idempotency_key(int(stamp), 1)
+        key = refund_idempotency_key(int(stamp), charge_id)
         first = payments.refund(charge_id, key)
         second = payments.refund(charge_id, key)
         check("Stripe returned the same refund both times", first == second,

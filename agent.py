@@ -28,6 +28,9 @@ import httpx
 
 log = logging.getLogger("support-agent")
 
+# Where the last handled message id is kept, on the Chatwoot conversation.
+HANDLED_ATTRIBUTE = "bot_last_message_id"
+
 
 # --------------------------------------------------------------------------
 # Configuration. Reading .env here keeps the whole system in one file with no
@@ -75,7 +78,13 @@ def require_env(*names: str, hint: str = "") -> str:
 
 MAX_AUTO_REFUND_CENTS = 5_000  # $50.00
 MAX_CHARGE_AGE_DAYS = 30
-MIN_CONFIDENCE = 0.8
+# Two of the three rubric points. Worth spelling out, because the arithmetic
+# decides real behaviour: a plain "I want my money back" scores clear request and
+# no hedging but does not name a charge, so it lands on 0.67 and is approved,
+# while "maybe I could get a refund?" loses the hedging point as well and is held
+# for a human. Requiring all three would hold almost every genuine request,
+# because customers hardly ever name the payment.
+MIN_CONFIDENCE = 0.6
 
 
 # --------------------------------------------------------------------------
@@ -110,6 +119,11 @@ class Conversation:
     id: int
     contact_email: str | None
     messages: tuple[Message, ...]
+    # The id of the last message this agent acted on, as recorded in Chatwoot's
+    # own custom_attributes. Remembering it there rather than in this process is
+    # what makes the memory survive a restart, and what stops a second copy of
+    # the agent answering the same message.
+    handled_message_id: int | None = None
 
     def turns(self, limit: int = 10) -> tuple[Turn, ...]:
         """The conversation as the model should read it, oldest last-limit first.
@@ -174,11 +188,35 @@ class Proposal:
     A proposal rather than a decision. The reply is used as written unless money
     moves, and whether money moves is settled afterwards by `refund_decision`,
     in code, against thresholds the model never sees.
+
+    Confidence is not asked for, it is worked out here from three plain questions
+    about the message. A model asked "how confident are you" is introspecting,
+    which it is bad at, and it returned a number that looked authoritative while
+    meaning little. Asked whether the request was clear, or whether the customer
+    hedged, it is reporting something observable. It also makes the note to the
+    human specific: "they hedged" rather than "confidence 0.67".
     """
 
     reply: str
     refund_requested: bool
-    confidence: float  # how sure it is about refund_requested
+    clear_request: bool  # they plainly asked, rather than mused about it
+    charge_identified: bool  # they said which payment they mean
+    hedging: bool  # "maybe", "I think", "would I be able to"
+
+    @property
+    def confidence(self) -> float:
+        return (
+            int(self.clear_request) + int(self.charge_identified) + int(not self.hedging)
+        ) / 3
+
+    @property
+    def signals(self) -> str:
+        """The rubric in words, for the note left to a colleague."""
+        return (
+            f"clear request: {'yes' if self.clear_request else 'no'}, "
+            f"charge identified: {'yes' if self.charge_identified else 'no'}, "
+            f"hedging: {'yes' if self.hedging else 'no'}"
+        )
 
 
 @dataclass(frozen=True)
@@ -197,6 +235,7 @@ class Inbox(Protocol):
     def send_reply(self, conversation_id: int, content: str) -> None: ...
     def add_private_note(self, conversation_id: int, content: str) -> None: ...
     def resolve(self, conversation_id: int) -> None: ...
+    def record_handled(self, conversation_id: int, message_id: int) -> None: ...
 
 
 class Payments(Protocol):
@@ -240,7 +279,7 @@ def refund_decision(
     if confidence < MIN_CONFIDENCE:
         return Decision(
             False,
-            f"classifier confidence {confidence:.2f} below {MIN_CONFIDENCE}",
+            f"rubric score {confidence:.2f} below {MIN_CONFIDENCE}",
         )
 
     if charge.refunded:
@@ -310,15 +349,22 @@ class HandledMessages:
         return len(self._ids)
 
 
-def refund_idempotency_key(conversation_id: int, message_id: int) -> str:
-    """A stable key for one refund request.
+def refund_idempotency_key(conversation_id: int, charge_id: str) -> str:
+    """A stable key for refunding this charge in this conversation.
 
-    Derived from the conversation and the message that asked for it, so every
-    retry of the same request carries the same key and Stripe returns the
-    original refund instead of issuing a second one. No personal data in it,
-    and well inside Stripe's 255 character limit.
+    Keyed on the charge rather than on the message that asked. Those differ in a
+    case that matters: if somebody asks twice in one conversation, two messages
+    mean two keys, and two keys mean Stripe treats the second attempt as a new
+    refund. Keyed on the charge, the second attempt returns the first refund,
+    which is the point of having a key at all. The policy would usually catch it
+    first, since the charge now reads as refunded, but that is a check racing a
+    write rather than a guarantee.
+
+    Readable on purpose. A hash would work equally well for Stripe and tell you
+    nothing when you are looking at it in their dashboard at four in the morning.
+    No personal data, and well inside Stripe's 255 character limit.
     """
-    return f"refund-conv{conversation_id}-msg{message_id}"
+    return f"refund-conv{conversation_id}-{charge_id}"
 
 
 HOLDING_REPLY = (
@@ -393,7 +439,12 @@ def handle_conversation(
     if latest is None or not latest.incoming:
         return "skipped"
 
+    # Two layers, cheapest first. The in-process set saves a round trip within a
+    # run; Chatwoot's marker is what survives a restart and is shared with any
+    # other copy of the agent.
     if handled is not None and latest.id in handled:
+        return "already handled"
+    if conversation.handled_message_id == latest.id:
         return "already handled"
 
     turns = conversation.turns()
@@ -416,12 +467,7 @@ def handle_conversation(
 
     if proposal.refund_requested:
         action = _handle_refund(
-            conversation,
-            proposal,
-            message_id=latest.id,
-            inbox=inbox,
-            payments=payments,
-            now=now,
+            conversation, proposal, inbox=inbox, payments=payments, now=now
         )
     else:
         inbox.send_reply(conversation.id, proposal.reply)
@@ -435,6 +481,7 @@ def handle_conversation(
     # transient model or network failure silently swallowed the message.
     if handled is not None:
         handled.add(latest.id)
+    inbox.record_handled(conversation.id, latest.id)
     return action
 
 
@@ -442,7 +489,6 @@ def _handle_refund(
     conversation: Conversation,
     proposal: Proposal,
     *,
-    message_id: int,
     inbox: Inbox,
     payments: Payments,
     now: datetime | None,
@@ -468,7 +514,8 @@ def _handle_refund(
         inbox.add_private_note(
             conversation.id,
             "Refund request held for review.\n"
-            f"Reason: {decision.reason}\n\n"
+            f"Reason: {decision.reason}\n"
+            f"Signals: {proposal.signals}\n\n"
             "The customer has been told a colleague will follow up.",
         )
         return "flagged"
@@ -478,7 +525,7 @@ def _handle_refund(
     # or by a restart after a crash between the refund and the reply, Stripe
     # returns the original refund rather than issuing another one.
     refund_id = payments.refund(
-        charge.id, refund_idempotency_key(conversation.id, message_id)
+        charge.id, refund_idempotency_key(conversation.id, charge.id)
     )
     log.info("refunded charge %s (%s)", charge.id, refund_id)
     inbox.send_reply(
@@ -600,6 +647,8 @@ class ChatwootInbox:
         """
         conversation_id = entry["id"]
         contact = (entry.get("meta") or {}).get("sender") or {}
+        attributes = entry.get("custom_attributes") or {}
+        handled = attributes.get(HANDLED_ATTRIBUTE)
         newest = [
             self._message(item)
             for item in (entry.get("messages") or [])
@@ -613,6 +662,7 @@ class ChatwootInbox:
             id=conversation_id,
             contact_email=contact.get("email"),
             messages=messages,
+            handled_message_id=int(handled) if str(handled).isdigit() else None,
         )
 
     def _all_messages(self, conversation_id: int) -> tuple[Message, ...]:
@@ -630,6 +680,20 @@ class ChatwootInbox:
         response = self._client.post(
             f"/conversations/{conversation_id}/toggle_status",
             json={"status": "resolved"},
+        )
+        response.raise_for_status()
+
+    def record_handled(self, conversation_id: int, message_id: int) -> None:
+        """Remember, in Chatwoot, which message this agent last acted on.
+
+        Chatwoot's own database becomes the memory, so it survives a restart and
+        is shared by anything polling the same account. An in-process set cannot
+        manage either: a crash forgets it, and a second copy of the agent has its
+        own, which is exactly how the same message got answered twice.
+        """
+        response = self._client.post(
+            f"/conversations/{conversation_id}/custom_attributes",
+            json={"custom_attributes": {HANDLED_ATTRIBUTE: message_id}},
         )
         response.raise_for_status()
 
@@ -848,14 +912,17 @@ PROPOSAL_SCHEMA = {
         "properties": {
             "reply": {"type": "string"},
             "refund_requested": {"type": "boolean"},
-            # Number or string. The model reliably writes "0.95" with quotes
-            # for some inputs, and a validator that rejects it fails the whole
-            # request rather than degrading. `_parse` coerces and range-checks
-            # it anyway, so insisting on the JSON type here bought nothing and
-            # cost every retry.
-            "confidence": {"type": ["number", "string"]},
+            "clear_request": {"type": "boolean"},
+            "charge_identified": {"type": "boolean"},
+            "hedging": {"type": "boolean"},
         },
-        "required": ["reply", "refund_requested", "confidence"],
+        "required": [
+            "reply",
+            "refund_requested",
+            "clear_request",
+            "charge_identified",
+            "hedging",
+        ],
         "additionalProperties": False,
     },
 }
@@ -878,11 +945,19 @@ reply, and you are not the one deciding.
 Reply as yourself, in the conversation, using what was said earlier. Do not
 repeat a greeting you have already given.
 
-Respond with a single JSON object and nothing else, of exactly this shape:
-{"reply": "...", "refund_requested": true or false, "confidence": 0.95}
+Then answer three plain questions about what they wrote. Answer them about the
+message in front of you, not about how sure you feel:
 
-confidence is a number between 0 and 1 saying how sure you are about
-refund_requested. Write it as a bare number, not in quotes."""
+  clear_request     did they plainly ask for a refund, rather than wondering
+                    aloud about one?
+  charge_identified did they say which payment they mean, by date, amount or
+                    description?
+  hedging           did they hedge, with "maybe", "I think", "would I be able
+                    to", or similar?
+
+Respond with a single JSON object and nothing else, of exactly this shape:
+{"reply": "...", "refund_requested": true, "clear_request": true,
+ "charge_identified": false, "hedging": false}"""
 
 
 class Brain:
@@ -1018,29 +1093,27 @@ class Brain:
     def _parse(payload: str) -> Proposal | None:
         """A proposal, or None if the reply cannot be trusted.
 
-        An empty reply, a non-boolean flag or an out-of-range confidence are all
-        treated like malformed JSON. Letting any of them through would corrupt
-        the refund decision, which compares that confidence against a threshold.
+        An empty reply or a flag that is not a real boolean is treated like
+        malformed JSON. Letting either through would corrupt the refund decision,
+        which scores those flags and compares the result to a threshold.
         """
         try:
             parsed = json.loads(payload)
             reply = parsed["reply"]
-            refund_requested = parsed["refund_requested"]
-            confidence = float(parsed["confidence"])
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            flags = {
+                name: parsed[name]
+                for name in ("refund_requested", "clear_request", "charge_identified", "hedging")
+            }
+        except (json.JSONDecodeError, KeyError, TypeError):
             return None
 
         if not isinstance(reply, str) or not reply.strip():
             return None
-        if not isinstance(refund_requested, bool):
+        # Every flag must be a real boolean. "yes" is truthy in Python, and
+        # letting a string through here would move money on a malformed reply.
+        if not all(isinstance(value, bool) for value in flags.values()):
             return None
-        if not 0.0 <= confidence <= 1.0:
-            return None
-        return Proposal(
-            reply=reply.strip(),
-            refund_requested=refund_requested,
-            confidence=confidence,
-        )
+        return Proposal(reply=reply.strip(), **flags)
 
     def _provider_preferences(self, *, require_parameters: bool = False) -> dict:
         """OpenRouter's provider routing block, when it applies.

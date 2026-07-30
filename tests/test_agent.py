@@ -34,6 +34,7 @@ class FakeInbox:
         self.replies: list[tuple[int, str]] = []
         self.notes: list[tuple[int, str]] = []
         self.resolved: list[int] = []
+        self.recorded: list[tuple[int, int]] = []
 
     def open_conversations(self):
         return self.conversations
@@ -46,6 +47,9 @@ class FakeInbox:
 
     def resolve(self, conversation_id):
         self.resolved.append(conversation_id)
+
+    def record_handled(self, conversation_id, message_id):
+        self.recorded.append((conversation_id, message_id))
 
 
 class FakePayments:
@@ -84,13 +88,22 @@ def conversation(
     )
 
 
-def understander(intent="support", confidence=0.95, text="here is your answer"):
+def understander(
+    intent="support",
+    confidence=None,
+    text="here is your answer",
+    clear=True,
+    charge_named=True,
+    hedging=False,
+):
     """Stands in for the model: proposes a reply and whether a refund is asked
     for."""
     return lambda turns, knowledge, articles=(): Proposal(
         reply=text,
         refund_requested=intent == "refund",
-        confidence=confidence,
+        clear_request=clear,
+        charge_identified=charge_named,
+        hedging=hedging,
     )
 
 
@@ -163,10 +176,16 @@ def test_a_single_refundable_charge_is_not_ambiguous():
     assert refund_decision(charge(sibling_unrefunded_count=0), 0.95, now=NOW).auto_approve
 
 
-def test_low_confidence_is_flagged():
-    decision = refund_decision(charge(), 0.5, now=NOW)
+def test_a_low_rubric_score_is_flagged():
+    decision = refund_decision(charge(), 1 / 3, now=NOW)
     assert not decision.auto_approve
-    assert "confidence" in decision.reason
+    assert "rubric score" in decision.reason
+
+
+def test_two_of_three_rubric_points_is_enough():
+    """A plain "I want my money back" names no charge, so it scores two thirds.
+    Requiring all three would hold nearly every genuine request."""
+    assert refund_decision(charge(), 2 / 3, now=NOW).auto_approve
 
 
 def test_missing_charge_is_flagged():
@@ -309,17 +328,23 @@ def test_refund_from_an_anonymous_conversation_is_held():
     assert payments.refunded == []
 
 
-def test_uncertain_refund_never_moves_money():
+def test_a_hedged_refund_never_moves_money():
+    """"maybe I want a refund?" loses the hedging point and the charge point, so
+    it lands under the threshold and goes to a human."""
     payments = FakePayments(charge())
-    action, inbox, payments = run(
+    inbox = FakeInbox()
+    action = handle_conversation(
         conversation("maybe I want a refund?"),
+        inbox=inbox,
         payments=payments,
-        intent="refund",
-        confidence=0.4,
+        understand=understander("refund", charge_named=False, hedging=True),
+        knowledge="guidance",
+        now=NOW,
     )
     assert action == "flagged"
     assert payments.refunded == []
-    assert "confidence" in inbox.notes[0][1]
+    assert "rubric score" in inbox.notes[0][1]
+    assert "hedging: yes" in inbox.notes[0][1], "the note should say which signal failed"
 
 
 def test_answered_conversation_is_resolved():

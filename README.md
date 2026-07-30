@@ -59,18 +59,27 @@ added after a customer writes in would look like a reply.
 That rule is correct but not instantaneous, so two more things guard against
 acting on the same message twice:
 
-- **The agent remembers the message ids it has handled.** Between classifying
-  a message and posting the reply, the customer's message is still the newest
-  thing in the conversation, so an overlapping pass, or a second copy of the
-  agent, would pick it up again. Ids are recorded only after the work
-  succeeds, so a transient failure is retried rather than swallowed. This is
-  in memory, and therefore gone on restart.
-- **Refunds carry a Stripe idempotency key** derived from the conversation and
-  message id, `refund-conv482-msg91`. If the same request ever reaches Stripe
-  twice, whether from a race or from a crash between issuing the refund and
-  posting the reply, Stripe returns the original refund instead of issuing a
-  second one. This is the backstop that survives a restart, and it is what
-  actually protects the money. Stripe keeps keys for at least 24 hours.
+- **The last handled message id is recorded on the Chatwoot conversation**, in
+  its `custom_attributes`, so the memory belongs to Chatwoot rather than to this
+  process. That is what survives a restart and is shared with any other copy of
+  the agent. An in-process set is kept as well, purely as the cheap first check
+  within a single run. Both are written only after the work succeeds, so a
+  transient failure is retried rather than swallowed.
+
+  This matters more than it sounds. With the set alone, a running agent and a
+  check script both answered the same conversations and posted duplicate
+  replies, because each process had its own memory. Verified with the marker: a
+  fresh process handles the message and records id 444; a second fresh process
+  then makes zero model calls and posts nothing.
+
+- **Refunds carry a Stripe idempotency key** built from the conversation and the
+  charge, `refund-conv482-ch_3Tym…`. Keyed on the charge rather than the message
+  that asked, because somebody asking twice in one conversation gives two
+  message ids, and two keys mean Stripe treats the second attempt as a new
+  refund. Keyed on the charge, the second attempt returns the first refund. The
+  policy would usually catch it first, since the charge then reads as refunded,
+  but that is a check racing a write rather than a guarantee. Stripe keeps keys
+  for at least 24 hours.
 
 Answered and refunded conversations are resolved. Chatwoot reopens one as
 soon as the customer writes again, so nothing is lost.
@@ -141,7 +150,7 @@ Auto-approval requires **all** of:
 | Amount at or under | `MAX_AUTO_REFUND_CENTS` = $50.00 |
 | Purchase within | `MAX_CHARGE_AGE_DAYS` = 30 days |
 | Previous refunds on the account | none |
-| Classifier confidence at or above | `MIN_CONFIDENCE` = 0.8 |
+| Rubric score at or above | `MIN_CONFIDENCE` = 0.6, two of three points |
 | Charge not already refunded, in full or in part | — |
 | Exactly one refundable charge, so there is nothing to guess | — |
 
@@ -153,11 +162,32 @@ the single most confusing thing to hit while demonstrating this. The
 acknowledgement deliberately says nothing about the outcome, because whether to
 refund is the human's decision.
 
-Two details that are easy to get wrong. Stripe sets `refunded` only when a
-charge is refunded *in full*, so a partly refunded charge looks untouched;
-both count as refunded here. And customers rarely say which payment they
-mean, so if more than one charge could still be refunded the agent refuses to
-choose.
+**Confidence is scored, not self-reported.** The model is never asked how sure
+it is. It answers three plain questions about the message instead, and the score
+is arithmetic in code:
+
+| Signal | Question |
+|---|---|
+| `clear_request` | did they plainly ask, rather than wonder aloud? |
+| `charge_identified` | did they say which payment, by date, amount or description? |
+| `hedging` | did they hedge, with "maybe", "I think", "would I be able to"? |
+
+A model asked to rate its own confidence is introspecting, which it is bad at,
+and it returned a number that looked authoritative while meaning little. These
+are observable. They also make the note to a colleague specific: "hedging: yes"
+rather than "confidence 0.67".
+
+The threshold is two of the three points. That arithmetic decides real
+behaviour: a plain "I want my money back" scores clear request and no hedging
+but names no charge, landing on 0.67 and approved, while "maybe I could get a
+refund?" loses the hedging point too and goes to a human. Requiring all three
+would hold nearly every genuine request, because customers hardly ever name the
+payment.
+
+Two more details that are easy to get wrong. Stripe sets `refunded` only when a
+charge is refunded *in full*, so a partly refunded charge looks untouched; both
+count as refunded here. And customers rarely say which payment they mean, so if
+more than one charge could still be refunded the agent refuses to choose.
 
 ## Setup
 

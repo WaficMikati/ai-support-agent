@@ -16,8 +16,20 @@ import pytest
 
 from agent import Article, Brain, Turn
 
-PROPOSAL = '{"reply":"here you go","refund_requested":false,"confidence":0.9}'
-REFUND_PROPOSAL = '{"reply":"looking into it","refund_requested":true,"confidence":0.95}'
+def proposal_json(reply="here you go", refund=False, clear=True, charge=True, hedging=False):
+    return json.dumps(
+        {
+            "reply": reply,
+            "refund_requested": refund,
+            "clear_request": clear,
+            "charge_identified": charge,
+            "hedging": hedging,
+        }
+    )
+
+
+PROPOSAL = proposal_json()
+REFUND_PROPOSAL = proposal_json(reply="looking into it", refund=True)
 
 CONVERSATION = (
     Turn(role="user", content="my delivery is late"),
@@ -103,7 +115,13 @@ def test_the_output_contract_asks_for_a_strict_schema():
     assert fmt["type"] == "json_schema"
     assert fmt["json_schema"]["strict"] is True
     schema = fmt["json_schema"]["schema"]
-    assert sorted(schema["required"]) == ["confidence", "refund_requested", "reply"]
+    assert sorted(schema["required"]) == [
+        "charge_identified",
+        "clear_request",
+        "hedging",
+        "refund_requested",
+        "reply",
+    ]
     assert schema["additionalProperties"] is False
 
 
@@ -163,20 +181,27 @@ def test_a_proposal_is_parsed():
     proposal = brain.understand(CONVERSATION, "be nice")
     assert proposal.reply == "looking into it"
     assert proposal.refund_requested is True
-    assert proposal.confidence == pytest.approx(0.95)
 
 
-def test_an_integer_confidence_is_coerced():
+@pytest.mark.parametrize(
+    ("clear", "charge", "hedging", "expected"),
+    [
+        (True, True, False, 1.0),
+        (True, False, False, pytest.approx(2 / 3)),
+        (True, False, True, pytest.approx(1 / 3)),
+        (False, False, True, 0.0),
+    ],
+)
+def test_confidence_is_scored_from_the_rubric_not_reported(clear, charge, hedging, expected):
+    """The model answers three plain questions; the number is arithmetic here."""
     brain, _, _ = brain_for(
-        [(200, completion('{"reply":"hi","refund_requested":false,"confidence":1}'))]
+        [(200, completion(proposal_json(refund=True, clear=clear, charge=charge, hedging=hedging)))]
     )
-    assert brain.understand(CONVERSATION, "be nice").confidence == pytest.approx(1.0)
+    assert brain.understand(CONVERSATION, "be nice").confidence == expected
 
 
 def test_surrounding_whitespace_is_trimmed_from_the_reply():
-    brain, _, _ = brain_for(
-        [(200, completion('{"reply":"  hi  ","refund_requested":false,"confidence":1}'))]
-    )
+    brain, _, _ = brain_for([(200, completion(proposal_json(reply="  hi  ")))])
     assert brain.understand(CONVERSATION, "be nice").reply == "hi"
 
 
@@ -191,16 +216,13 @@ def test_surrounding_whitespace_is_trimmed_from_the_reply():
         ("prose", "sure, I can help with that"),
         ("truncated json", '{"reply":"hi","refund_requested":false'),
         ("malformed json", '{"reply":"hi" "refund_requested":false}'),
-        ("missing reply", '{"refund_requested":false,"confidence":0.9}'),
-        ("missing flag", '{"reply":"hi","confidence":0.9}'),
-        ("empty reply", '{"reply":"","refund_requested":false,"confidence":0.9}'),
-        ("blank reply", '{"reply":"   ","refund_requested":false,"confidence":0.9}'),
-        ("flag as string", '{"reply":"hi","refund_requested":"yes","confidence":0.9}'),
-        ("confidence too high", '{"reply":"hi","refund_requested":true,"confidence":42}'),
-        (
-            "confidence not a number",
-            '{"reply":"hi","refund_requested":true,"confidence":"high"}',
-        ),
+        ("missing reply", '{"refund_requested":false,"clear_request":true,"charge_identified":true,"hedging":false}'),
+        ("missing a rubric flag", '{"reply":"hi","refund_requested":false,"clear_request":true,"hedging":false}'),
+        ("empty reply", proposal_json(reply="")),
+        ("blank reply", proposal_json(reply="   ")),
+        ("refund flag as string", '{"reply":"hi","refund_requested":"yes","clear_request":true,"charge_identified":true,"hedging":false}'),
+        ("rubric flag as string", '{"reply":"hi","refund_requested":true,"clear_request":"yes","charge_identified":true,"hedging":false}'),
+        ("rubric flag as number", '{"reply":"hi","refund_requested":true,"clear_request":1,"charge_identified":true,"hedging":false}'),
         ("empty", ""),
     ],
 )
@@ -210,19 +232,17 @@ def test_an_unusable_proposal_is_retried_then_accepted(label, reply):
     assert len(seen) == 2, "should have asked again"
 
 
-def test_a_string_flag_is_never_treated_as_a_refund_request():
-    """"yes" is truthy in Python; letting it through would move money on a
-    malformed reply."""
-    bad = '{"reply":"hi","refund_requested":"yes","confidence":0.99}'
-    brain, _, _ = brain_for([(200, completion(bad))] * Brain.MAX_ATTEMPTS)
-    with pytest.raises(RuntimeError):
-        brain.understand(CONVERSATION, "be nice")
-
-
-def test_a_confidence_outside_zero_to_one_is_never_returned():
-    """refund_decision compares this to a threshold, so 42 would auto-approve
-    everything."""
-    bad = '{"reply":"hi","refund_requested":true,"confidence":42}'
+@pytest.mark.parametrize(
+    "bad",
+    [
+        '{"reply":"hi","refund_requested":"yes","clear_request":true,"charge_identified":true,"hedging":false}',
+        '{"reply":"hi","refund_requested":1,"clear_request":true,"charge_identified":true,"hedging":false}',
+        '{"reply":"hi","refund_requested":true,"clear_request":"yes","charge_identified":true,"hedging":false}',
+    ],
+)
+def test_a_flag_that_is_not_a_boolean_is_never_accepted(bad):
+    """"yes" and 1 are both truthy in Python. Letting either through would score
+    the rubric off a string and move money on a malformed reply."""
     brain, _, _ = brain_for([(200, completion(bad))] * Brain.MAX_ATTEMPTS)
     with pytest.raises(RuntimeError):
         brain.understand(CONVERSATION, "be nice")
@@ -274,21 +294,3 @@ def test_requests_are_authorised():
     brain.understand(CONVERSATION, "be nice")
     assert seen[0].headers["Authorization"] == "Bearer gsk_test"
 
-
-def test_a_numeric_string_confidence_is_accepted():
-    """Some inputs make the model write "0.95" with quotes every single time.
-    The schema allows it and the value is coerced, rather than failing the
-    request five times over a JSON type."""
-    brain, _, _ = brain_for(
-        [(200, completion('{"reply":"hi","refund_requested":true,"confidence":"0.95"}'))]
-    )
-    proposal = brain.understand(CONVERSATION, "be nice")
-    assert proposal.confidence == pytest.approx(0.95)
-    assert proposal.refund_requested is True
-
-
-def test_the_schema_allows_confidence_as_either_type():
-    brain, seen, _ = brain_for([(200, completion(PROPOSAL))])
-    brain.understand(CONVERSATION, "be nice")
-    schema = body_of(seen[0])["response_format"]["json_schema"]["schema"]
-    assert schema["properties"]["confidence"]["type"] == ["number", "string"]

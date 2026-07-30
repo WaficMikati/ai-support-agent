@@ -33,6 +33,7 @@ class RecordingInbox:
     def __init__(self):
         self.replies: list[str] = []
         self.resolved: list[int] = []
+        self.recorded: list[tuple[int, int]] = []
         self._next_id = 0
 
     def open_conversations(self):
@@ -56,6 +57,12 @@ class RecordingInbox:
     def resolve(self, conversation_id):
         self.resolved.append(conversation_id)
 
+    def record_handled(self, conversation_id, message_id):
+        pass
+
+    def record_handled(self, conversation_id, message_id):
+        self.recorded.append((conversation_id, message_id))
+
 
 def run_passes(knowledge_file, passes: int, inbox) -> None:
     """Drive run_forever for a fixed number of passes by raising from sleep."""
@@ -73,7 +80,11 @@ def run_passes(knowledge_file, passes: int, inbox) -> None:
             inbox=inbox,
             payments=None,
             understand=lambda turns, knowledge, articles=(): Proposal(
-                reply=knowledge.strip(), refund_requested=False, confidence=0.99
+                reply=knowledge.strip(),
+                refund_requested=False,
+                clear_request=True,
+                charge_identified=True,
+                hedging=False,
             ),
             interval_seconds=0,
         )
@@ -103,7 +114,11 @@ def test_editing_the_knowledge_file_takes_effect_without_a_restart(tmp_path):
             inbox=inbox,
             payments=None,
             understand=lambda turns, knowledge_text, articles=(): Proposal(
-                reply=knowledge_text.strip(), refund_requested=False, confidence=0.99
+                reply=knowledge_text.strip(),
+                refund_requested=False,
+                clear_request=True,
+                charge_identified=True,
+                hedging=False,
             ),
             interval_seconds=0,
         )
