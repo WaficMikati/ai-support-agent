@@ -610,6 +610,11 @@ class Brain:
 
     DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
     DEFAULT_MODEL = "openai/gpt-oss-20b:free"
+    # Both jobs here want the most likely answer, not a creative one. Left at
+    # the provider default, which is usually 1.0, a small model occasionally
+    # drops a stray token into an otherwise fine sentence, and the classifier's
+    # confidence wanders between runs on identical input.
+    DEFAULT_TEMPERATURE = 0.0
 
     def __init__(
         self,
@@ -617,10 +622,12 @@ class Brain:
         model: str = DEFAULT_MODEL,
         base_url: str = DEFAULT_BASE_URL,
         provider_order: tuple[str, ...] = (),
+        temperature: float = DEFAULT_TEMPERATURE,
         transport: httpx.BaseTransport | None = None,
         sleep=time.sleep,
     ):
         self._model = model
+        self._temperature = temperature
         self._sleep = sleep
         # `provider` is an OpenRouter extension. Sending it to a plain
         # OpenAI-shaped endpoint like Groq risks a rejected request, so it only
@@ -734,7 +741,12 @@ class Brain:
     MAX_ATTEMPTS = 3
 
     def _chat(self, messages: list[dict], **extra) -> str:
-        payload = {"model": self._model, "messages": messages, **extra}
+        payload = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": self._temperature,
+            **extra,
+        }
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             response = self._client.post("/chat/completions", json=payload)
             if response.is_success:
@@ -792,6 +804,9 @@ def main() -> None:
             name.strip()
             for name in os.environ.get("OPENROUTER_PROVIDER", "").split(",")
             if name.strip()
+        ),
+        temperature=float(
+            os.environ.get("MODEL_TEMPERATURE", Brain.DEFAULT_TEMPERATURE)
         ),
     )
 

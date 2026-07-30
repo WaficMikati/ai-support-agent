@@ -61,6 +61,13 @@ soon as the customer writes again, so nothing is lost.
 `knowledge.md` is re-read on every poll. Editing it changes the answers
 within one interval, with no restart.
 
+**Temperature is pinned to 0.** Both jobs want the most likely answer rather
+than a creative one, and this is not cosmetic: left at the provider default,
+a 20B model occasionally dropped a stray Chinese or Arabic character into an
+otherwise correct English support reply, and the classifier returned 0.90,
+0.95 and 0.98 on byte-identical input. At 0 the classification repeats exactly
+and the replies come out clean. `MODEL_TEMPERATURE` overrides it.
+
 ## Refund policy
 
 Auto-approval requires **all** of:
@@ -156,7 +163,7 @@ uv run python agent.py
 ## Tests
 
 ```bash
-uv run pytest                          # 97 tests, no network, no credentials
+uv run pytest                          # 99 tests, no network, no credentials
 uv run python scripts/live_check.py    # the inbox adapter against live Chatwoot
 uv run python scripts/e2e_check.py     # everything live: OpenRouter, Stripe, Chatwoot
 uv run python scripts/reload_check.py  # editing knowledge.md with the agent running
@@ -179,13 +186,14 @@ restores the file afterwards.
 
   **Do not rely on the schema alone.** OpenRouter serves a model through
   several provider endpoints and only some enforce `strict: true` with
-  constrained decoding; the rest treat it as a suggestion. Requests send
-  `provider: {require_parameters: true}`, but that filters on what a provider
-  *advertises*, not on what it does. So the classifier prompt also spells out
-  the JSON contract. An earlier prompt said "reply with refund" and relied on
-  enforcement: a non-enforcing endpoint followed the words and returned prose,
-  which the enforcing one had been quietly covering up. Belt and braces is
-  also what makes the model and provider swappable.
+  constrained decoding; the rest generate JSON by following instructions.
+  Requests send `provider: {require_parameters: true}`, but that filters on
+  what a provider *advertises*, not on what it does. So the classifier prompt
+  also spells out the JSON contract, and an unusable reply is retried. An
+  earlier prompt said "reply with refund" and never mentioned JSON, relying
+  entirely on enforcement: a non-enforcing endpoint followed the words and
+  returned prose, which the enforcing one had been quietly covering up. Belt
+  and braces is also what makes the model and provider swappable.
 
   `OPENROUTER_PROVIDER=Groq,Fireworks` pins the endpoint and disables
   fallbacks, if you ever need to guarantee which one serves a request.

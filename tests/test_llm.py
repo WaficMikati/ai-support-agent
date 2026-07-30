@@ -53,6 +53,37 @@ def test_classification_asks_for_a_strict_schema():
     assert schema["additionalProperties"] is False
 
 
+def test_both_calls_pin_the_temperature():
+    """Left unset, a small model drops stray tokens into otherwise fine
+    sentences and the classifier's confidence wanders on identical input."""
+    brain, seen, _ = brain_for(
+        [
+            (200, completion('{"intent":"refund","confidence":0.9}')),
+            (200, completion("an answer")),
+        ]
+    )
+    brain.classify("money back")
+    brain.answer("q", "kb")
+    assert [json.loads(r.content)["temperature"] for r in seen] == [0.0, 0.0]
+
+
+def test_the_temperature_is_configurable():
+    seen: list[httpx.Request] = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=completion("hi"))
+
+    brain = Brain(
+        "gsk_test",
+        temperature=0.4,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _s: None,
+    )
+    brain.answer("q", "kb")
+    assert json.loads(seen[0].content)["temperature"] == 0.4
+
+
 def test_the_customer_message_is_the_user_turn():
     brain, seen, _ = brain_for([(200, completion('{"intent":"support","confidence":0.7}'))])
     brain.classify("I cannot log in")
