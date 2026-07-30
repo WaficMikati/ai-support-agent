@@ -65,6 +65,9 @@ class FakePayments:
     def latest_charge(self, email):
         return self.charge
 
+    def charges_for(self, email):
+        return [self.charge] if self.charge else []
+
     def refund(self, charge_id, idempotency_key):
         self.refunded.append(charge_id)
         self.keys.append(idempotency_key)
@@ -349,9 +352,10 @@ def test_each_reason_for_holding_gets_its_own_explanation():
     """The model writes before the policy runs, so it cannot know a colleague is
     taking over. Where code knows the payment is the problem, it says so instead
     of leaving a question that is moot by the time it arrives."""
+    # "ambiguous" is deliberately absent: more than one payment is now a
+    # question put to the customer rather than a reason to fetch a colleague.
     cases = {
         "already_refunded": (charge(refunded=True), "already been refunded"),
-        "ambiguous": (charge(sibling_unrefunded_count=2), "more than one payment"),
         "too_large": (charge(amount_cents=90_000), "needs a colleague to approve"),
         "too_old": (
             charge(created=NOW - timedelta(days=MAX_CHARGE_AGE_DAYS + 1)),

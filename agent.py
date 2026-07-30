@@ -287,6 +287,7 @@ class Inbox(Protocol):
 
 class Payments(Protocol):
     def latest_charge(self, email: str) -> Charge | None: ...
+    def charges_for(self, email: str) -> list[Charge]: ...
     def refund(self, charge_id: str, idempotency_key: str) -> str: ...
 
 
@@ -614,6 +615,7 @@ class State:
     now: datetime | None = None
 
     articles: tuple[Article, ...] = ()
+    charges: tuple[Charge, ...] = ()
     proposal: Proposal | None = None
     charge: Charge | None = None
     decision: Decision | None = None
@@ -761,38 +763,99 @@ def announced(reply: str, conversation: Conversation) -> str:
     return f"{IDENTITY_NOTICE.format(email=known)}\n\n{reply}"
 
 
-def describe_charge(charge: Charge | None) -> str:
-    """A payment as a sentence, for the model to read.
+AMOUNT_PATTERN = re.compile(r"\d+(?:[.,]\d{1,2})?")
+NEWEST_WORDS = ("most recent", "latest", "newest", "last one", "recent one")
+OLDEST_WORDS = ("oldest", "earliest", "first one")
 
-    Deliberately no charge id: it is meaningless to the customer, and anything
-    put in front of the model can end up quoted back to them.
+
+def stated_choice(
+    conversation: Conversation, charges: Sequence[Charge]
+) -> Charge | None:
+    """Which payment the customer named, when they named exactly one.
+
+    Read out of their words in code, the same way the address is. The model is
+    never asked which charge to refund: it can say that a refund is wanted, and
+    the customer can say which payment, and neither of those is the same as
+    choosing whose money moves.
+
+    Only the newest thing they said counts, so changing their mind works.
     """
-    if charge is None:
-        # Phrased as a fact rather than as a failed search. "No payment was
-        # found" reads to the model like the lookup broke, and it then tells the
-        # customer it does not have the information, which is the opposite of
-        # what it just learned.
+    if len(charges) < 2:
+        return charges[0] if charges else None
+
+    said = ""
+    for turn in reversed(conversation.turns()):
+        if turn.role == "user":
+            said = turn.content.lower()
+            break
+    if not said:
+        return None
+
+    if any(word in said for word in NEWEST_WORDS):
+        return charges[0]
+    if any(word in said for word in OLDEST_WORDS):
+        return charges[-1]
+
+    # An amount, which is how people actually refer to a payment. Anything
+    # matching more than one charge is no use, so it is left undecided.
+    wanted = set()
+    for found in AMOUNT_PATTERN.findall(said):
+        figure = found.replace(",", ".")
+        try:
+            wanted.add(int(round(float(figure) * 100)))
+        except ValueError:
+            continue
+        if "." not in figure:
+            # "20" means twenty of something, not twenty cents.
+            wanted.add(int(figure) * 100)
+
+    matched = [charge for charge in charges if charge.amount_cents in wanted]
+    return matched[0] if len(matched) == 1 else None
+
+
+def why_not(charge: Charge, now: datetime | None = None) -> str:
+    """What stands in the way of refunding this one, in a customer's words.
+
+    Only the reasons that belong to the payment itself. How clearly they asked,
+    and whether there is more than one to choose between, are about the
+    conversation rather than about this charge.
+    """
+    now = now or datetime.now(timezone.utc)
+    if charge.disputed:
+        return "being disputed with your bank"
+    if charge.refunded:
+        return "already refunded"
+    if charge.amount_cents > MAX_AUTO_REFUND_CENTS:
+        return "over the amount I can refund on my own"
+    if (now - charge.created) > timedelta(days=MAX_CHARGE_AGE_DAYS):
+        return "outside the refund window"
+    return ""
+
+
+def describe_charges(charges: Sequence[Charge], now: datetime | None = None) -> str:
+    """The payments on the account, one per line, with what is wrong with each.
+
+    Written for somebody choosing between them, so a payment that cannot be
+    refunded is still listed and still says why. Leaving it out would answer
+    "what did I pay?" with a shorter list than the truth, and quietly drop the
+    one they were about to ask about.
+    """
+    if not charges:
         return "This account has no payments on record. There is nothing to show."
 
-    said = [
-        f"Most recent payment: {money(charge.amount_cents, charge.currency)} "
-        f"on {charge.created:%d %B %Y}."
-    ]
-    # Only worth saying when it is true. Told a payment "has not been refunded"
-    # the model repeats it, so somebody who asked what they had paid was
-    # answered with a refund status they never raised, which reads like the
-    # agent bracing for an argument. Whether a refund can happen is settled in
-    # code regardless, so nothing downstream needs this line.
-    if charge.refunded:
-        said.append("It has already been refunded.")
-    others = charge.sibling_unrefunded_count
-    if others:
-        said.append(
-            f"There is {others} other unrefunded payment on this account."
-            if others == 1
-            else f"There are {others} other unrefunded payments on this account."
+    lines = []
+    for charge in charges:
+        stops = why_not(charge, now)
+        lines.append(
+            f"- {money(charge.amount_cents, charge.currency)} on "
+            f"{charge.created:%d %B %Y}" + (f" ({stops})" if stops else "")
         )
-    return " ".join(said)
+    heading = (
+        "This account has one payment:"
+        if len(charges) == 1
+        else f"This account has {len(charges)} payments:"
+    )
+    return heading + "\n" + "\n".join(lines)
 
 
 def account_tools(state: State) -> dict[str, ToolFunction]:
@@ -806,7 +869,11 @@ def account_tools(state: State) -> dict[str, ToolFunction]:
     email = identified_email(state.conversation)
     if not email:
         return {}
-    return {"get_last_purchase": lambda: describe_charge(state.payments.latest_charge(email))}
+    return {
+        "get_payments": lambda: describe_charges(
+            state.payments.charges_for(email), state.now
+        )
+    }
 
 
 def understand_node(state: State) -> State:
@@ -858,7 +925,32 @@ def refund_node(state: State) -> State:
     """
     assert state.proposal is not None
     known = identified_email(state.conversation)
-    state.charge = state.payments.latest_charge(known) if known else None
+    state.charges = tuple(state.payments.charges_for(known)) if known else ()
+
+    # Anything already refunded cannot be chosen, but it is still listed, so a
+    # customer looking at their own history sees all of it.
+    refundable = [charge for charge in state.charges if not charge.refunded]
+    pool = refundable or list(state.charges)
+    chosen = stated_choice(state.conversation, pool)
+
+    if chosen is None and len(pool) > 1:
+        # Undecided rather than impossible. Reporting no charge here would say
+        # there are no payments when there are several, and hand to a colleague
+        # a question the customer can answer in a word.
+        state.charge = None
+        state.decision = Decision(
+            False,
+            f"customer has {len(pool)} payments and has not said which",
+            "ambiguous",
+        )
+        return state
+
+    # Their choice settles which one, so the policy no longer has to refuse for
+    # not being able to tell them apart. Everything else about the charge still
+    # applies, and is what decides whether the money moves.
+    state.charge = (
+        replace(chosen, sibling_unrefunded_count=0) if chosen is not None else None
+    )
     state.decision = refund_decision(
         state.charge, state.proposal.confidence, now=state.now
     )
@@ -923,12 +1015,37 @@ def hold_node(state: State) -> State:
     return state
 
 
+def choose_node(state: State) -> State:
+    """Show the payments and ask which one, instead of handing it to a person.
+
+    Being told "there is more than one payment, so a colleague will look" is a
+    dead end for something the customer can settle in a word. They are shown
+    what is on the account, including any payment that cannot be refunded and
+    why, and the next thing they say picks one.
+
+    Written here rather than by the model because it lists amounts and dates,
+    and left open because it is a question, not a hand-off.
+    """
+    state.inbox.send_reply(
+        state.conversation.id,
+        announced(
+            "I can see more than one payment, so I would rather not guess.\n\n"
+            + describe_charges(state.charges, state.now)
+            + "\n\nWhich would you like refunded?",
+            state.conversation,
+        ),
+    )
+    state.action = "asked which"
+    return state
+
+
 NODES: dict[str, Callable[[State], State]] = {
     "understand": understand_node,
     "answer": answer_node,
     "refund": refund_node,
     "execute_refund": execute_refund_node,
     "hold": hold_node,
+    "choose": choose_node,
 }
 
 def wants_refund(state: State) -> bool:
@@ -954,10 +1071,18 @@ EDGES: dict[str, Callable[[State], str | None]] = {
     "understand": lambda s: "refund" if wants_refund(s) else "answer",
     # What the policy allows. This edge is the money gate, and nothing the model
     # returned is consulted here beyond the rubric score the policy scores itself.
-    "refund": lambda s: "execute_refund" if s.decision.auto_approve else "hold",
+    # More than one payment is a question for the customer, not a job for a
+    # colleague: they can answer it in a word, and being handed to a person for
+    # it is a dead end.
+    "refund": lambda s: (
+        "execute_refund"
+        if s.decision.auto_approve
+        else ("choose" if s.decision.code == "ambiguous" else "hold")
+    ),
     "answer": lambda s: None,
     "execute_refund": lambda s: None,
     "hold": lambda s: None,
+    "choose": lambda s: None,
 }
 
 
@@ -1365,45 +1490,61 @@ class StripePayments:
         somebody has already been partly refunded for."""
         return bool(entry.get("refunded")) or entry.get("amount_refunded", 0) > 0
 
-    def latest_charge(self, email: str) -> Charge | None:
+    def charges_for(self, email: str) -> list[Charge]:
+        """Every payment on the account, newest first.
+
+        The whole list was always fetched and all but one of it thrown away.
+        Keeping it is what lets somebody with two payments be shown both and
+        asked which they mean, rather than told we cannot tell them apart.
+
+        Each one carries the counts measured against the whole set, so the
+        policy can be applied to whichever is chosen without fetching again.
+        """
         customers = self._client.get("/customers", params={"email": email, "limit": 1})
         customers.raise_for_status()
         found = customers.json()["data"]
         if not found:
-            return None
+            return []
 
         charges = self._client.get(
             "/charges", params={"customer": found[0]["id"], "limit": 100}
         )
         charges.raise_for_status()
         entries = charges.json()["data"]
-        if not entries:
+
+        refunded_total = sum(1 for item in entries if self._has_any_refund(item))
+        untouched_total = sum(1 for item in entries if not self._has_any_refund(item))
+
+        built = []
+        for entry in entries:
+            refunded = self._has_any_refund(entry)
+            built.append(
+                Charge(
+                    id=entry["id"],
+                    amount_cents=entry["amount"],
+                    created=self._created(entry),
+                    refunded=refunded,
+                    # Other refunds on the account, not counting this one.
+                    prior_refund_count=refunded_total - (1 if refunded else 0),
+                    # Other payments that could equally be the one they mean.
+                    sibling_unrefunded_count=(
+                        untouched_total - (0 if refunded else 1)
+                    ),
+                    disputed=bool(entry.get("disputed")),
+                    currency=str(entry.get("currency") or "usd"),
+                )
+            )
+        return built
+
+    def latest_charge(self, email: str) -> Charge | None:
+        charges = self.charges_for(email)
+        if not charges:
             return None
-
-        prior_refund_count = sum(1 for item in entries if self._has_any_refund(item))
-        untouched = [item for item in entries if not self._has_any_refund(item)]
-
-        if untouched:
-            # Newest charge that could still be refunded, plus how many other
-            # candidates there are, so the policy can refuse to guess.
-            target = untouched[0]
-            siblings = len(untouched) - 1
-        else:
-            # Everything is already refunded. Return the newest anyway so the
-            # policy can say so rather than reporting no charge at all.
-            target = entries[0]
-            siblings = 0
-
-        return Charge(
-            id=target["id"],
-            amount_cents=target["amount"],
-            created=self._created(target),
-            refunded=self._has_any_refund(target),
-            prior_refund_count=prior_refund_count - (0 if untouched else 1),
-            sibling_unrefunded_count=siblings,
-            disputed=bool(target.get("disputed")),
-            currency=str(target.get("currency") or "usd"),
-        )
+        # The newest that could still be refunded. If they are all refunded,
+        # the newest of those, so the policy can say so rather than reporting
+        # no charge at all.
+        untouched = [charge for charge in charges if not charge.refunded]
+        return untouched[0] if untouched else charges[0]
 
     @staticmethod
     def _created(entry: dict) -> datetime:
@@ -1514,15 +1655,17 @@ Respond with a single JSON object and nothing else, of exactly this shape:
 # talk about it; whether a refund happens is still settled by refund_decision,
 # in code, after it has finished.
 TOOL_SPECS: dict[str, dict] = {
-    "get_last_purchase": {
+    "get_payments": {
         "type": "function",
         "function": {
-            "name": "get_last_purchase",
+            "name": "get_payments",
             "description": (
-                "Look up this customer's most recent payment: the amount, the "
-                "date, and whether any of it has already been refunded. Use it "
-                "whenever they ask about what they paid, when, or how much. "
-                "Takes no arguments: the customer is already identified."
+                "Look up this customer's payments: the amount and date of each, "
+                "and anything standing in the way of refunding it. Use it "
+                "whenever they ask about what they paid, when, or how much, and "
+                "before asking them for an order number or a date, which this "
+                "already tells you. Takes no arguments: the customer is already "
+                "identified."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },

@@ -157,6 +157,9 @@ class StubPayments:
     def latest_charge(self, email):
         return None
 
+    def charges_for(self, email):
+        return []
+
     def refund(self, charge_id, idempotency_key):
         raise AssertionError("no refund in these tests")
 

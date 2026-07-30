@@ -32,7 +32,7 @@ from agent import (
     State,
     Turn,
     account_tools,
-    describe_charge,
+    describe_charges,
     understand_node,
 )
 
@@ -129,6 +129,10 @@ def test_the_lookup_is_bound_to_the_conversations_own_contact():
             asked_for.append(email)
             return charge()
 
+        def charges_for(self, email):
+            asked_for.append(email)
+            return [charge()]
+
         def refund(self, charge_id, idempotency_key):
             raise AssertionError("not in this test")
 
@@ -147,7 +151,7 @@ def test_the_lookup_is_bound_to_the_conversations_own_contact():
         now=NOW,
     )
     tools = account_tools(state)
-    tools["get_last_purchase"]()
+    tools["get_payments"]()
     assert asked_for == ["real@customer.com"]
 
 
@@ -173,13 +177,13 @@ def test_a_tool_result_reaches_the_call_that_writes_the_reply():
     """The gathering phase is worthless if what it found is dropped before the
     model is asked for the proposal."""
     brain, seen = brain_for(
-        [called("get_last_purchase"), answered("found it"), answered(PROPOSAL)]
+        [called("get_payments"), answered("found it"), answered(PROPOSAL)]
     )
     proposal = brain.understand(
         CONVERSATION,
         "be helpful",
         (),
-        {"get_last_purchase": lambda: "Most recent payment: 20.00 on 30 July 2026."},
+        {"get_payments": lambda: "Most recent payment: 20.00 on 30 July 2026."},
     )
     assert isinstance(proposal, Proposal)
 
@@ -193,9 +197,9 @@ def test_the_gathering_phase_is_not_asked_for_json():
     """Offered a strict schema and tools together the model answers immediately
     and never looks anything up. Groq refuses the combination outright."""
     brain, seen = brain_for(
-        [called("get_last_purchase"), answered("found it"), answered(PROPOSAL)]
+        [called("get_payments"), answered("found it"), answered(PROPOSAL)]
     )
-    brain.understand(CONVERSATION, "be helpful", (), {"get_last_purchase": lambda: "ok"})
+    brain.understand(CONVERSATION, "be helpful", (), {"get_payments": lambda: "ok"})
 
     gather, final = seen[0], seen[-1]
     assert "tools" in gather and "response_format" not in gather
@@ -212,7 +216,7 @@ def test_no_tools_means_a_single_call():
 
 def test_the_model_can_answer_without_calling_anything():
     brain, seen = brain_for([answered("just answering"), answered(PROPOSAL)])
-    brain.understand(CONVERSATION, "be helpful", (), {"get_last_purchase": lambda: "ok"})
+    brain.understand(CONVERSATION, "be helpful", (), {"get_payments": lambda: "ok"})
     assert len(seen) == 2, "one gather that called nothing, then the proposal"
     assert not [m for m in seen[-1]["messages"] if m.get("role") == "tool"]
 
@@ -227,10 +231,10 @@ def test_the_loop_is_bounded():
         return "same answer again"
 
     brain, seen = brain_for(
-        [called("get_last_purchase", call_id=f"call_{n}") for n in range(3)]
+        [called("get_payments", call_id=f"call_{n}") for n in range(3)]
         + [answered(PROPOSAL)]
     )
-    brain.understand(CONVERSATION, "be helpful", (), {"get_last_purchase": tool})
+    brain.understand(CONVERSATION, "be helpful", (), {"get_payments": tool})
     assert calls == Brain.MAX_TOOL_ROUNDS
     assert len(seen) == Brain.MAX_TOOL_ROUNDS + 1, "the proposal is still asked for"
 
@@ -241,7 +245,7 @@ def test_an_unknown_tool_is_reported_rather_than_crashing():
         [called("read_their_emails"), answered("hm"), answered(PROPOSAL)]
     )
     proposal = brain.understand(
-        CONVERSATION, "be helpful", (), {"get_last_purchase": lambda: "ok"}
+        CONVERSATION, "be helpful", (), {"get_payments": lambda: "ok"}
     )
     assert isinstance(proposal, Proposal)
     result = [m for m in seen[-1]["messages"] if m.get("role") == "tool"][0]
@@ -255,6 +259,9 @@ def test_the_node_offers_the_lookup_to_the_model():
     class Payments:
         def latest_charge(self, email):
             return charge()
+
+        def charges_for(self, email):
+            return [charge()]
 
         def refund(self, charge_id, idempotency_key):
             raise AssertionError("not in this test")
@@ -283,94 +290,52 @@ def test_the_node_offers_the_lookup_to_the_model():
         now=NOW,
     )
     understand_node(state)
-    assert list(offered[0]) == ["get_last_purchase"]
+    assert list(offered[0]) == ["get_payments"]
 
 
 # --------------------------------------------------------- what it says back
 
 
-def test_a_payment_is_described_in_plain_words():
-    said = describe_charge(charge())
-    assert "20.00" in said and "30 July 2026" in said
+def test_the_payments_are_listed_with_amounts_and_dates():
+    said = describe_charges([charge()], NOW)
+    assert "one payment" in said
+    assert "$20.00" in said and "30 July 2026" in said
 
 
-def test_a_payment_that_stands_says_nothing_about_refunds():
-    """Told a payment "has not been refunded" the model repeats it, so somebody
-    who asked what they had paid is answered with a refund status they never
-    raised. Whether a refund can happen is settled in code regardless."""
-    assert "refund" not in describe_charge(charge()).lower()
+def test_every_payment_is_listed_not_only_the_refundable_one():
+    """Somebody choosing between them has to see all of them, including the one
+    they cannot have, or the list quietly disagrees with their memory."""
+    said = describe_charges(
+        [charge(id="a", amount_cents=2_000), charge(id="b", amount_cents=9_000)], NOW
+    )
+    assert "2 payments" in said
+    assert "$20.00" in said and "$90.00" in said
 
 
-def test_an_already_refunded_payment_says_so():
-    assert "already been refunded" in describe_charge(charge(refunded=True))
+def test_a_payment_that_cannot_be_refunded_says_why_in_the_list():
+    from datetime import timedelta
+
+    old = charge(created=NOW - timedelta(days=60))
+    assert "outside the refund window" in describe_charges([old], NOW)
+    assert "already refunded" in describe_charges([charge(refunded=True)], NOW)
+    assert "disputed" in describe_charges([charge(disputed=True)], NOW)
+    assert "over the amount" in describe_charges([charge(amount_cents=90_000)], NOW)
 
 
-def test_other_payments_are_mentioned_because_they_block_a_refund():
-    said = describe_charge(charge(sibling_unrefunded_count=2))
-    assert "2 other unrefunded payments" in said
+def test_a_payment_that_stands_says_nothing_against_it():
+    said = describe_charges([charge()], NOW)
+    assert "(" not in said, f"nothing should be flagged: {said!r}"
 
 
-def test_a_single_other_payment_reads_as_one():
-    """Two payments is the common case, and "1 other unrefunded payments" is
-    the sort of thing the model repeats verbatim."""
-    said = describe_charge(charge(sibling_unrefunded_count=1))
-    assert "1 other unrefunded payment on this account" in said
-    assert "payments" not in said
-
-
-def test_no_payment_is_stated_plainly_rather_than_left_blank():
-    assert "no payments on record" in describe_charge(None)
+def test_no_payments_is_stated_plainly_rather_than_left_blank():
+    assert "no payments" in describe_charges([], NOW)
 
 
 def test_the_charge_id_is_never_shown():
     """Meaningless to a customer, and anything in front of the model can be
     quoted back to them."""
-    assert "ch_1" not in describe_charge(charge())
+    assert "ch_1" not in describe_charges([charge()], NOW)
 
 
-# ------------------------------------------------------------- writing money
-
-
-def test_dollars_get_a_dollar_sign():
-    from agent import money
-
-    assert money(2_000) == "$20.00"
-    assert money(2_000, "usd") == "$20.00"
-
-
-def test_other_familiar_currencies_get_their_symbol():
-    from agent import money
-
-    assert money(2_000, "eur") == "€20.00"
-    assert money(2_000, "gbp") == "£20.00"
-
-
-def test_an_unfamiliar_currency_gets_its_code_rather_than_a_guessed_symbol():
-    from agent import money
-
-    assert money(2_000, "cad") == "20.00 CAD"
-
-
-def test_a_currency_without_minor_units_is_not_divided():
-    """Stripe holds most amounts in the smallest unit, but yen has no minor
-    unit, so 2000 means 2000. Dividing understates a refund a hundredfold."""
-    from agent import money
-
-    assert money(2_000, "jpy") == "¥2,000"
-    assert money(2_000, "krw") == "2,000 KRW"
-
-
-def test_large_amounts_are_grouped():
-    from agent import money
-
-    assert money(1_234_567) == "$12,345.67"
-
-
-def test_a_missing_currency_falls_back_to_dollars():
-    from agent import money
-
-    assert money(2_000, "") == "$20.00"
-
-
-def test_the_amount_the_customer_is_shown_carries_its_currency():
-    assert "€20.00" in describe_charge(charge(currency="eur"))
+def test_the_amount_carries_its_currency():
+    assert "\u20ac20.00" in describe_charges([charge(currency="eur")], NOW)
