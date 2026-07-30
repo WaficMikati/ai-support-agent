@@ -227,6 +227,11 @@ class Proposal:
 class Decision:
     auto_approve: bool
     reason: str
+    # The same thing as `reason`, in a form code can branch on. `reason` is
+    # written for the colleague who picks the ticket up and says exactly which
+    # threshold was missed; this says which case it was, so the customer can be
+    # told something true without publishing the policy back at them.
+    code: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -286,16 +291,19 @@ def refund_decision(
     now = now or datetime.now(timezone.utc)
 
     if charge is None:
-        return Decision(False, "no charge found for this customer")
+        return Decision(False, "no charge found for this customer", "no_charge")
 
     if confidence < MIN_CONFIDENCE:
         return Decision(
             False,
             f"rubric score {confidence:.2f} below {MIN_CONFIDENCE}",
+            "unclear_request",
         )
 
     if charge.refunded:
-        return Decision(False, f"charge {charge.id} has already been refunded")
+        return Decision(
+            False, f"charge {charge.id} has already been refunded", "already_refunded"
+        )
 
     if charge.sibling_unrefunded_count > 0:
         total = charge.sibling_unrefunded_count + 1
@@ -303,6 +311,7 @@ def refund_decision(
             False,
             f"customer has {total} unrefunded charges, cannot tell which one "
             "they mean",
+            "ambiguous",
         )
 
     if charge.amount_cents > MAX_AUTO_REFUND_CENTS:
@@ -310,20 +319,25 @@ def refund_decision(
             False,
             f"amount {charge.amount_cents / 100:.2f} over the "
             f"{MAX_AUTO_REFUND_CENTS / 100:.2f} auto-approval limit",
+            "too_large",
         )
 
     age = now - charge.created
     if age > timedelta(days=MAX_CHARGE_AGE_DAYS):
         return Decision(
-            False, f"charge is {age.days} days old, limit is {MAX_CHARGE_AGE_DAYS}"
+            False,
+            f"charge is {age.days} days old, limit is {MAX_CHARGE_AGE_DAYS}",
+            "too_old",
         )
 
     if charge.prior_refund_count > 0:
         return Decision(
-            False, f"customer has {charge.prior_refund_count} previous refund(s)"
+            False,
+            f"customer has {charge.prior_refund_count} previous refund(s)",
+            "prior_refunds",
         )
 
-    return Decision(True, "within auto-approval policy")
+    return Decision(True, "within auto-approval policy", "approved")
 
 
 # --------------------------------------------------------------------------
@@ -393,14 +407,37 @@ ESCALATION_NOTICE = (
     "receive an email within the next 24 hours."
 )
 
-# Said instead of the model's reply, not after it, when a refund is asked for on
-# an account with nothing on it. Code knows this for certain and the model
-# usually does not: asked for a refund it often never looks, and when it does
-# look it tends to report that it cannot see the payment rather than that there
-# is not one. Either way it ends up asking for a date or an amount that would
-# not help, which reads badly next to a message saying the request has already
-# been passed on.
-NO_PAYMENT_REPLY = "I'm sorry, I couldn't find any payments on this account."
+# What the customer is told when a person has to decide, keyed by why.
+#
+# Said instead of the model's reply rather than after it. The model writes
+# before the policy runs, so it cannot know a colleague is about to take over,
+# and what it writes in the meantime is usually a question, asking which payment
+# they meant or for a date. By the time that arrives it is moot, and it argues
+# with the sentence underneath saying the request has already been passed on.
+# Code knows exactly which case it hit, and that makes a better sentence than a
+# question the model had to guess at.
+#
+# None of these quote a threshold. The colleague's note gives the number; the
+# customer gets the shape of the problem without the policy being published back
+# at them.
+HELD_EXPLANATIONS: dict[str, str] = {
+    "no_charge": "I'm sorry, I couldn't find any payments on this account.",
+    "already_refunded": "It looks like that payment has already been refunded.",
+    "ambiguous": (
+        "There is more than one payment on your account, so I would rather not "
+        "guess which one you mean."
+    ),
+    "too_large": "A refund of that amount needs a colleague to approve it.",
+    "too_old": "That payment is older than I am able to refund automatically.",
+    "prior_refunds": (
+        "Because of earlier refunds on your account, this one needs a colleague "
+        "to look at it."
+    ),
+    # "unclear_request" is deliberately absent. There the doubt is about what
+    # the customer meant, not about the payment, so the model's own words are
+    # the better answer: somebody who said "maybe I could get a refund?" is
+    # better served by whatever it asked back than by a flat statement.
+}
 
 # Phrases that would tell a customer their money is on the way. Deliberately
 # blunt: this only has to catch a model that ignored the instruction not to
@@ -426,22 +463,18 @@ def safe_holding_reply(reply: str) -> str:
     return reply
 
 
-def held_reply(reply: str, *, charge_found: bool = True) -> str:
+def held_reply(reply: str, code: str = "") -> str:
     """What the customer is told when a person has to decide.
 
-    The model's own words first, so anything else they asked is still answered,
-    then the one sentence that must always be there. Guaranteed rather than
-    hoped for: the model was told not to promise an outcome, and this is what
-    the customer is owed instead.
-
-    With nothing on the account the model's words are dropped rather than kept.
-    It is the one case where code is better informed than the model, and where
-    what the model tends to write, a request for a date or an amount, actively
-    contradicts the sentence that follows it.
+    Always ends with the same commitment, because that part is owed whatever
+    went wrong. What comes before it depends on whether code knows something
+    concrete about the payment: if it does, it says that, and if the doubt is
+    only about what the customer meant, the model's own words are kept so
+    anything else they asked still gets answered.
     """
-    if not charge_found:
-        return f"{NO_PAYMENT_REPLY}\n\n{ESCALATION_NOTICE}"
-    return f"{safe_holding_reply(reply).rstrip()}\n\n{ESCALATION_NOTICE}"
+    explanation = HELD_EXPLANATIONS.get(code)
+    opening = explanation if explanation else safe_holding_reply(reply).rstrip()
+    return f"{opening}\n\n{ESCALATION_NOTICE}"
 
 
 def retrieval_query(turns: Sequence[Turn]) -> str:
@@ -646,7 +679,7 @@ def hold_node(state: State) -> State:
     # coming back when a human has not agreed to it.
     state.inbox.send_reply(
         state.conversation.id,
-        held_reply(state.proposal.reply, charge_found=state.charge is not None),
+        held_reply(state.proposal.reply, state.decision.code),
     )
     # Deliberately left open, and not resolved: a person still has to act.
     state.inbox.add_private_note(

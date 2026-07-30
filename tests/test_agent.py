@@ -269,20 +269,67 @@ def test_a_held_refund_still_tells_the_customer_something():
     assert len(inbox.replies) == 1, "the customer must not be left in silence"
 
 
-def test_a_held_refund_keeps_the_reply_the_model_wrote():
-    """So a message that asked two things gets both addressed, rather than a
-    fixed sentence about refunds only."""
-    payments = FakePayments(charge(amount_cents=90_000))
+def test_a_hedged_request_keeps_the_reply_the_model_wrote():
+    """When the doubt is about what the customer meant rather than about the
+    payment, the model's words are the better answer: it may have asked
+    something useful, and a message that asked two things still gets both."""
     inbox = FakeInbox()
     handle_conversation(
-        conversation("cancel me and refund this month"),
+        conversation("cancel me, and maybe a refund?"),
         inbox=inbox,
-        payments=payments,
-        understand=understander("refund", text="I have cancelled your subscription."),
+        payments=FakePayments(charge()),
+        understand=understander(
+            "refund",
+            text="I have cancelled your subscription.",
+            clear=False,
+            charge_named=False,
+            hedging=True,
+        ),
         knowledge="guidance",
         now=NOW,
     )
     assert inbox.replies[0][1].startswith("I have cancelled your subscription.")
+
+
+def test_each_reason_for_holding_gets_its_own_explanation():
+    """The model writes before the policy runs, so it cannot know a colleague is
+    taking over. Where code knows the payment is the problem, it says so instead
+    of leaving a question that is moot by the time it arrives."""
+    cases = {
+        "already_refunded": (charge(refunded=True), "already been refunded"),
+        "ambiguous": (charge(sibling_unrefunded_count=2), "more than one payment"),
+        "too_large": (charge(amount_cents=90_000), "needs a colleague to approve"),
+        "too_old": (
+            charge(created=NOW - timedelta(days=MAX_CHARGE_AGE_DAYS + 1)),
+            "older than I am able to refund",
+        ),
+        "prior_refunds": (charge(prior_refund_count=1), "earlier refunds"),
+        "no_charge": (None, "couldn't find any payments"),
+    }
+    for name, (on_file, expected) in cases.items():
+        inbox = FakeInbox()
+        handle_conversation(
+            conversation("refund me"),
+            inbox=inbox,
+            payments=FakePayments(on_file),
+            understand=understander("refund", text="Which payment do you mean?"),
+            knowledge="guidance",
+            now=NOW,
+        )
+        reply = inbox.replies[0][1]
+        assert expected in reply, f"{name}: got {reply!r}"
+        assert "Which payment do you mean?" not in reply, f"{name} kept a moot question"
+        assert "within the next 24 hours" in reply, f"{name} dropped the commitment"
+
+
+def test_no_explanation_quotes_a_threshold():
+    """The colleague's note gives the number. The customer gets the shape of the
+    problem without the policy being published back at them."""
+    from agent import HELD_EXPLANATIONS
+
+    for name, sentence in HELD_EXPLANATIONS.items():
+        assert "50" not in sentence and "30" not in sentence, name
+        assert "limit" not in sentence.lower(), name
 
 
 def test_a_refund_on_an_empty_account_says_there_is_nothing_there():
