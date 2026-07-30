@@ -339,9 +339,20 @@ class DemoHandler(SimpleHTTPRequestHandler):
             cleared = 0
             if route == "/reset" and mine:
                 cleared = clear_queue(reset_demo.settings(), email=mine)
-                # Then let go of the contact, so the browser coming back with a
-                # fresh cookie can be this person again rather than a stranger.
-                release_contact(reset_demo.settings(), mine)
+
+            # Let go of any contact already holding these details, so the browser
+            # that comes back after the reload can claim them. Chatwoot keeps one
+            # contact per email and per identifier, and setUser against a taken
+            # one fails without saying so: the visitor stays nameless, the agent
+            # cannot look anything up, and the only symptom is being asked for an
+            # address it then refuses to accept.
+            #
+            # Registering matters as much as resetting here. Somebody arriving in
+            # a fresh browser and typing an address they used earlier takes the
+            # register path, and the contact from that earlier visit is still
+            # holding it.
+            for address in {mine, wanted} - {""}:
+                release_contact(reset_demo.settings(), address)
             body = {
                 "ok": True,
                 "cleared": cleared,
