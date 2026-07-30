@@ -340,7 +340,11 @@ class DemoHandler(SimpleHTTPRequestHandler):
             # address they were given last time. A first arrival has none.
             mine = str(asked.get("email") or "").strip()
             wanted = str(asked.get("register_email") or "").strip()
-            if route == "/register" and not EMAIL.match(wanted):
+            # Checked on both routes. Rebuilding is the same act as registering
+            # as far as Stripe and Chatwoot are concerned, and validating only
+            # the first of the two let a later rebuild quietly rename somebody
+            # to the fallback or file them under nonsense.
+            if not EMAIL.match(wanted):
                 raise ValueError(f"{wanted!r} does not look like an email address")
             given = " ".join(
                 part for part in (
@@ -348,7 +352,7 @@ class DemoHandler(SimpleHTTPRequestHandler):
                     str(asked.get("last_name") or "").strip(),
                 ) if part
             )
-            if route == "/register" and not given:
+            if not given:
                 raise ValueError("a first and last name are needed")
 
             cleared = 0

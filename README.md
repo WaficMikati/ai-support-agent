@@ -33,7 +33,7 @@ Chatwoot  ──poll──▶  the conversation so far
                             │
                             ▼
                   ┌──── gather ────┐          read-only tools
-                  │  may call      │◀────────  get_last_purchase
+                  │  may call      │◀────────  get_payments
                   └────────┬───────┘           (bounded, 3 rounds)
                            ▼
                      one more call, schema enforced
@@ -64,12 +64,17 @@ code, against thresholds the model never sees.
 That flow is written as a graph, because the routing is the interesting part:
 
 ```python
-NODES = {"understand": ..., "answer": ..., "refund": ..., "execute_refund": ..., "hold": ...}
+NODES = {"understand", "answer", "refund", "execute_refund", "hold", "choose"}
 
 EDGES = {
-    "understand": lambda s: "refund" if s.proposal.refund_requested else "answer",
-    "refund":     lambda s: "execute_refund" if s.decision.auto_approve else "hold",
-    "answer": lambda s: None, "execute_refund": lambda s: None, "hold": lambda s: None,
+    # what the model asked for, once there is somebody to ask about
+    "understand": lambda s: "refund" if wants_refund(s) else "answer",
+    # what the policy allows. More than one payment is a question for the
+    # customer, not a job for a colleague.
+    "refund": lambda s: (
+        "execute_refund" if s.decision.auto_approve
+        else ("choose" if s.decision.code == "ambiguous" else "hold")
+    ),
 }
 
 def run_graph(state, start="understand"):
@@ -90,11 +95,11 @@ cannot make it move.
 ## What the model may look up
 
 Ask it *"how much was my last purchase?"* and it answers, because it can call a
-tool before replying:
+tool before replying, which returns every payment on the account:
 
 ```python
-TOOL_SPECS = {"get_last_purchase": {...  "parameters": {"type": "object",
-                                                        "properties": {}}}}
+TOOL_SPECS = {"get_payments": {...  "parameters": {"type": "object",
+                                                  "properties": {}}}}
 ```
 
 Two things about that definition matter more than the mechanism.
@@ -107,9 +112,15 @@ finished. There is a test asserting no tool name can spend.
 **Every tool takes no arguments.** This is the security property rather than a
 simplification. A lookup accepting an email address would let the model pass
 along whatever the customer typed, so anybody could read a stranger's payment
-history by naming their address. Who the customer is comes from Chatwoot's
-contact record — set when they signed in — and is bound by the caller. The model
-chooses *whether* to look, never *whose* record to look at. Also tested.
+history by naming their address. Who the customer is is bound by the
+caller, from the address they registered with, and the model chooses *whether*
+to look, never *whose* record to look at. Also tested.
+
+That address travels in the Chatwoot contact's custom attributes rather than on
+the contact record itself. Chatwoot allows one contact per email and one per
+identifier, and will not change an identifier once set, so `setUser` fails
+silently whenever a returning visitor or a reused address is in the way. Four
+separate bugs came out of depending on it before this stopped.
 
 ### Why it takes two calls
 
@@ -282,7 +293,13 @@ uv run python agent.py         # the agent
 uv run python demo/serve.py    # the demo page, on http://localhost:8080
 ```
 
-Open <http://localhost:8080>, click the chat bubble, and ask something:
+Open <http://localhost:8080>. Sign in with a name and an email — anything will
+do, nothing is sent anywhere — and that is who you are for the rest of the
+session. It stays in the header, which matters more than it sounds: an anonymous
+chat asks for your address and refuses any other, so a half-remembered one looks
+exactly like a broken agent. The menu there changes your details or signs you out.
+
+Then click the chat bubble and ask something:
 
 - *"can I skip a month?"* — answered from the help centre
 - *"do you have decaf?"* — answered from the help centre
@@ -292,14 +309,38 @@ Open <http://localhost:8080>, click the chat bubble, and ask something:
 
 Replies take two to five seconds, longer when a lookup happens.
 
+### What the chat may know about you
+
+Two choices, and they are the interesting half of the demo. They ride on the
+Chatwoot contact, so one shared instance can have every visitor set differently.
+
+| How the chat starts | |
+|---|---|
+| **Identified** | Like a signed-in session. It knows from the start, and opens by saying which address it was given, so what it knows is on screen before it is used. |
+| **Anonymous** | A stranger until an address is said out loud. No lookup is offered until then, and the agent asks before discussing an account. |
+
+| Which address an anonymous chat accepts | |
+|---|---|
+| **Gated** | Only the one this browser registered with. Anyone else's is refused. |
+| **Open** | Any address, looked up as typed. |
+
+**Open is not a bug, it is the lesson.** It is what a first implementation does.
+Type a colleague's address under *open* and their payments come back; switch to
+*gated* and it refuses. That is the argument for verifying identity rather than
+believing it, in two clicks.
+
+Neither model hands the model an identifier. Both read the address out of the
+conversation in code, so the tools stay argument-free either way; the difference
+is only whether it is checked against the person we already had.
+
 ### Setting the customer up
 
-**Start a fresh conversation** resolves the open queue, builds a new customer in
-Stripe, and reloads. Use it between runs; a plain refresh resumes the same
-conversation.
+**Rebuild it and start a fresh conversation** closes your own open conversations,
+rebuilds your payment history in Stripe, and reloads. Your identity does not
+change, so you can try every scenario as the same person.
 
-The selectors above the button decide what that customer looks like, so every
-branch of the policy can be shown rather than described:
+The selectors decide what that history looks like, so every branch of the policy
+can be shown rather than described:
 
 | Account history | What the refund does |
 |---|---|
@@ -307,7 +348,7 @@ branch of the policy can be shown rather than described:
 | That payment is already refunded | held, already refunded |
 | That payment is disputed with the bank | held, disputed |
 | An earlier payment was refunded before | held, earlier refunds |
-| Two payments, neither refunded | held, cannot tell which |
+| Two payments, neither refunded | asks which one you mean |
 | No payments at all | held, nothing on the account |
 
 Amount and date appear wherever there is a payment to give them to, and they
@@ -319,6 +360,14 @@ The line underneath states what to expect. It works out which check will fire
 first, in the order the policy uses, so choosing *$90.00* alongside *an earlier
 payment was refunded* correctly says "over the auto-approval limit" — that is
 what the policy really does, since it stops at the first failure.
+
+With two payments it does not fetch a colleague, which is a dead end for
+something you can settle in a word. It lists them with amounts, dates and
+anything standing in the way of each, and offers them as buttons. Naming one, by
+amount or by date or by tapping, refunds it or explains what is wrong with that
+particular payment. A payment that cannot be refunded is still listed and still
+says why: leaving it out answers with a shorter history than the truth and drops
+the one you were about to ask about.
 
 The private notes in Chatwoot are the other half of the demo: open the
 conversation there and the reason is written out, for approvals as well as
@@ -346,13 +395,14 @@ deploy/
   env.example             upstream Chatwoot settings
 scripts/
   setup_chatwoot.py       creates the account, inboxes and token
+  add_admin.py            gives somebody else an administrator login
   seed_helpcenter.py      writes the mock documentation into Chatwoot
   reset_demo.py           clears conversations and payment fixtures
   live_check.py           the inbox adapter against a running Chatwoot
   e2e_check.py            everything live: model, Stripe test mode, Chatwoot
   reload_check.py         proves editing knowledge.md needs no restart
   classify_eval.py        labelled messages, scoring the refund judgement
-tests/                    218 tests, no network and no credentials needed
+tests/                    264 tests, no network and no credentials needed
 notes/                    answers to questions this raised, written up as they came
 ```
 
@@ -540,7 +590,7 @@ with nothing before it.
 ## Checking it works
 
 ```bash
-uv run pytest                                   # 218 tests, no network, no credentials
+uv run pytest                                   # 264 tests, no network, no credentials
 uv run python scripts/live_check.py             # the inbox adapter against live Chatwoot
 uv run python scripts/e2e_check.py              # everything live, including a real refund
 uv run python scripts/reload_check.py           # editing knowledge.md with the agent running
@@ -577,6 +627,46 @@ unreproducible in the running agent.
 | `--quick` | six phrasings that have actually gone wrong. Before a demo. |
 | *(no flag)* | all 22. After one. |
 | `--bare` | guidance only, for comparing the two configurations. |
+
+---
+
+## Sharing it with other people
+
+Two tunnels, because the widget's script, its iframe and its websocket are all
+fetched by the visitor's browser. Serve them the page while telling them Chatwoot
+is on localhost and that is *their* machine, so the bubble never appears.
+
+```bash
+cloudflared tunnel --url http://localhost:3000    # Chatwoot
+cloudflared tunnel --url http://localhost:8080    # the demo page
+```
+
+Put the Chatwoot one in `.env` as `PUBLIC_CHATWOOT_URL` and restart
+`demo/serve.py`. Which URL the page hands out depends on how it was reached, so
+setting this does not break your own machine when a tunnel stops.
+
+Each visitor gets their own customer, their own conversation and their own Stripe
+charges, and the reset only closes their own, so one person starting again does
+not end somebody else's conversation mid-sentence.
+
+Quick tunnels get a new random URL every time they start. Do not restart one
+mid-session: the link people are holding dies with it, and `PUBLIC_CHATWOOT_URL`
+has to be re-pointed.
+
+**The Chatwoot login is then publicly reachable.** An unguessable hostname is not
+access control, and the credentials in `deploy/admin.local.txt` work from
+anywhere.
+
+### Letting somebody else into the dashboard
+
+```bash
+uv run python scripts/add_admin.py them@example.com "Their Name"
+```
+
+Prints a password once and stores nothing. Run it again for the same address and
+it resets the password rather than failing, which is the usual reason to run it
+twice. Their own login rather than a shared one, so the dashboard shows who
+replied to what and revoking one person does not lock everybody out.
 
 ---
 

@@ -133,7 +133,7 @@ def main() -> int:
         if portal and not bare
         else None
     )
-    tools = {} if bare else {"get_last_purchase": lambda: DEMO_CHARGE}
+    tools = {} if bare else {"get_payments": lambda: DEMO_CHARGE}
 
     print(f"model: {brain._model}")
     print(

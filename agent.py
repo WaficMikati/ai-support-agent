@@ -953,23 +953,35 @@ def refund_node(state: State) -> State:
     known = identified_email(state.conversation)
     state.charges = tuple(state.payments.charges_for(known)) if known else ()
 
-    # Anything already refunded cannot be chosen, but it is still listed, so a
-    # customer looking at their own history sees all of it.
     refundable = [charge for charge in state.charges if not charge.refunded]
-    pool = refundable or list(state.charges)
-    chosen = stated_choice(state.conversation, pool)
 
-    if chosen is None and len(pool) > 1:
+    # Chosen from everything that was listed, not only what could be refunded.
+    # Matching against the refundable ones alone meant naming a payment that was
+    # shown but already refunded matched nothing, so the same question came back
+    # with no explanation, and there was no way out of it. Letting it through
+    # here means the policy answers with the reason instead.
+    named = stated_choice(state.conversation, state.charges) if state.charges else None
+
+    if named is not None:
+        chosen = named
+    elif len(refundable) == 1:
+        # Only one it could be, so nothing to ask about.
+        chosen = refundable[0]
+    elif len(refundable) > 1:
         # Undecided rather than impossible. Reporting no charge here would say
         # there are no payments when there are several, and hand to a colleague
         # a question the customer can answer in a word.
         state.charge = None
         state.decision = Decision(
             False,
-            f"customer has {len(pool)} payments and has not said which",
+            f"customer has {len(refundable)} payments and has not said which",
             "ambiguous",
         )
         return state
+    else:
+        # Everything is refunded, or there is nothing at all. Take the newest so
+        # the policy can say which of those it is.
+        chosen = state.charges[0] if state.charges else None
 
     # Their choice settles which one, so the policy no longer has to refuse for
     # not being able to tell them apart. Everything else about the charge still
@@ -1907,6 +1919,13 @@ class Brain:
             ]
 
         conversation = [{"role": t.role, "content": t.content} for t in turns]
+        # Anything without a spec cannot be offered, and saying so matters: a
+        # caller passing a name that had been renamed went on believing the tool
+        # was available, and the run that was meant to prove it silently proved
+        # the opposite.
+        unknown = [name for name in (tools or {}) if name not in TOOL_SPECS]
+        if unknown:
+            log.warning("no spec for %s, so it was not offered", ", ".join(unknown))
         specs = [TOOL_SPECS[name] for name in (tools or {}) if name in TOOL_SPECS]
         if specs:
             # The gathering phase is deliberately not told to answer in JSON.

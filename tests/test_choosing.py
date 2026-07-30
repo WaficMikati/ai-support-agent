@@ -241,3 +241,30 @@ def test_a_day_with_the_wrong_month_is_not_a_choice():
 
 def test_a_month_on_its_own_settles_nothing():
     assert stated_choice(said("the may one"), TWO) is None
+
+
+def test_naming_a_listed_payment_that_is_already_refunded_says_so():
+    """It was shown, so it can be named. Matching only against the refundable
+    ones meant that answer matched nothing and the same question came back, with
+    no explanation and no way out of it."""
+    charges = [charge(2_000), charge(3_500), charge(9_000, refunded=True)]
+    action, inbox, payments = act(said("refund me", "the $90 one"), charges)
+    assert action == "flagged"
+    assert payments.refunded == []
+    assert "already been refunded" in inbox.replies[0]
+
+
+def test_one_refundable_among_several_needs_no_choosing():
+    """Two payments but only one that could be refunded is not a choice."""
+    charges = [charge(2_000), charge(9_000, refunded=True)]
+    action, _, payments = act(said("refund me"), charges)
+    assert action == "refunded"
+    assert payments.refunded == ["ch_2000"]
+
+
+def test_everything_refunded_reports_that_rather_than_asking():
+    charges = [charge(2_000, refunded=True), charge(3_500, refunded=True)]
+    action, inbox, payments = act(said("refund me"), charges)
+    assert action == "flagged"
+    assert payments.refunded == []
+    assert "already been refunded" in inbox.replies[0]
