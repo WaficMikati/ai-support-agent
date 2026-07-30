@@ -7,7 +7,15 @@ bare KeyError.
 
 import pytest
 
-from agent import Classification, Conversation, Message, load_env_file, require_env, run_forever
+from agent import (
+    Classification,
+    Conversation,
+    Message,
+    env_value,
+    load_env_file,
+    require_env,
+    run_forever,
+)
 
 
 class StopLoop(Exception):
@@ -150,7 +158,7 @@ def test_a_missing_env_file_is_not_an_error(tmp_path):
 def test_missing_variable_explains_itself(monkeypatch):
     monkeypatch.delenv("FOO_MISSING", raising=False)
     with pytest.raises(SystemExit) as failure:
-        require_env("FOO_MISSING", "Get it from somewhere.")
+        require_env("FOO_MISSING", hint="Get it from somewhere.")
     message = str(failure.value)
     assert "FOO_MISSING" in message
     assert ".env" in message
@@ -161,3 +169,31 @@ def test_blank_variable_counts_as_missing(monkeypatch):
     monkeypatch.setenv("FOO_BLANK", "   ")
     with pytest.raises(SystemExit):
         require_env("FOO_BLANK")
+
+
+# ------------------------------------------------- provider-neutral env names
+
+
+def test_the_model_name_is_preferred_over_the_openrouter_one(monkeypatch):
+    monkeypatch.setenv("MODEL_API_KEY", "new")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "old")
+    assert env_value("MODEL_API_KEY", "OPENROUTER_API_KEY") == "new"
+
+
+def test_the_openrouter_name_still_works(monkeypatch):
+    """Existing .env files must keep running after the rename."""
+    monkeypatch.delenv("MODEL_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "old")
+    assert env_value("MODEL_API_KEY", "OPENROUTER_API_KEY") == "old"
+
+
+def test_a_default_is_used_when_neither_is_set(monkeypatch):
+    monkeypatch.delenv("MODEL_NAME", raising=False)
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    assert env_value("MODEL_NAME", "OPENROUTER_MODEL", default="fallback") == "fallback"
+
+
+def test_a_blank_value_falls_through(monkeypatch):
+    monkeypatch.setenv("MODEL_NAME", "   ")
+    monkeypatch.setenv("OPENROUTER_MODEL", "real")
+    assert env_value("MODEL_NAME", "OPENROUTER_MODEL") == "real"

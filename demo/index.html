@@ -11,6 +11,11 @@
     p.lede { color: #555; margin-top: 0; }
     .hint { margin-top: 3rem; padding: 1rem 1.25rem; background: #f4f4f5; border-radius: .5rem;
             font-size: .95rem; color: #444; }
+    button.reset { margin-top: 1.5rem; padding: .5rem .9rem; font: inherit; font-size: .9rem;
+                   border: 1px solid #d4d4d8; background: #fff; border-radius: .4rem;
+                   cursor: pointer; color: #444; }
+    button.reset:hover { background: #f4f4f5; }
+    #reset-note { font-size: .85rem; color: #777; margin-top: .6rem; min-height: 1.2em; }
   </style>
 </head>
 <body>
@@ -19,7 +24,13 @@
   <p>Our support agent answers common questions straight away. Anything it is
   not sure about goes to a person.</p>
   <div class="hint">Open the chat bubble in the corner and ask something, for
-  example <em>"I can't log in and the reset email never arrives"</em>.</div>
+  example <em>"I can't log in and the reset email never arrives"</em>. To try a
+  refund, enter <em>demo@example.com</em> when it asks for your email.</div>
+
+  <p id="reset-note">To start over, open this page in a private window, or run
+  <code>uv run python scripts/reset_demo.py</code>. A refresh will not do it:
+  the widget keeps the visitor in a signed token that the page itself cannot
+  clear, because the chat runs in an iframe on its own origin.</p>
 
   <script>
     (function (d, t) {

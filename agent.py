@@ -46,10 +46,23 @@ def load_env_file(path: str | Path = ".env") -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
-def require_env(name: str, hint: str = "") -> str:
-    value = os.environ.get(name, "").strip()
+def env_value(*names: str, default: str = "") -> str:
+    """The first of these variables that is set.
+
+    Lets the model settings be named for what they are rather than for one
+    provider, while still honouring the older OPENROUTER_* names.
+    """
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return default
+
+
+def require_env(*names: str, hint: str = "") -> str:
+    value = env_value(*names)
     if not value:
-        message = f"{name} is not set. Add it to .env or export it."
+        message = f"{names[0]} is not set. Add it to .env or export it."
         raise SystemExit(f"{message} {hint}".strip())
     return value
 
@@ -801,7 +814,8 @@ def main() -> None:
         raise SystemExit(f"knowledge file not found: {knowledge_path}")
 
     stripe_key = require_env(
-        "STRIPE_API_KEY", "A restricted key from a Stripe sandbox (rk_test_...)."
+        "STRIPE_API_KEY",
+        hint="A restricted key from a Stripe sandbox (rk_test_...).",
     )
     # This is a demo and stays in a test environment, so refuse anything that
     # could move real money rather than trusting the operator to notice.
@@ -811,22 +825,30 @@ def main() -> None:
             "This agent only runs against Stripe test mode."
         )
 
-    chatwoot_url = require_env("CHATWOOT_URL", "e.g. http://localhost:3000")
+    chatwoot_url = require_env("CHATWOOT_URL", hint="e.g. http://localhost:3000")
     inbox = ChatwootInbox(
         base_url=chatwoot_url,
-        account_id=require_env("CHATWOOT_ACCOUNT_ID", "e.g. 1"),
-        token=require_env("CHATWOOT_TOKEN", "Chatwoot Profile Settings -> Access Token."),
+        account_id=require_env("CHATWOOT_ACCOUNT_ID", hint="e.g. 1"),
+        token=require_env(
+            "CHATWOOT_TOKEN", hint="Chatwoot Profile Settings -> Access Token."
+        ),
     )
     payments = StripePayments(stripe_key)
+    # MODEL_* is the honest name, since any OpenAI-shaped endpoint works here.
+    # The OPENROUTER_* names still work so existing .env files keep running.
     brain = Brain(
         require_env(
-            "OPENROUTER_API_KEY", "Free from openrouter.ai, no card needed."
+            "MODEL_API_KEY",
+            "OPENROUTER_API_KEY",
+            hint="Free from openrouter.ai, no card needed.",
         ),
-        model=os.environ.get("OPENROUTER_MODEL", Brain.DEFAULT_MODEL),
-        base_url=os.environ.get("OPENROUTER_BASE_URL", Brain.DEFAULT_BASE_URL),
+        model=env_value("MODEL_NAME", "OPENROUTER_MODEL", default=Brain.DEFAULT_MODEL),
+        base_url=env_value(
+            "MODEL_BASE_URL", "OPENROUTER_BASE_URL", default=Brain.DEFAULT_BASE_URL
+        ),
         provider_order=tuple(
             name.strip()
-            for name in os.environ.get("OPENROUTER_PROVIDER", "").split(",")
+            for name in env_value("MODEL_PROVIDER", "OPENROUTER_PROVIDER").split(",")
             if name.strip()
         ),
         temperature=float(
