@@ -464,13 +464,21 @@ def test_refund_with_no_matching_customer_is_held():
     assert "no charge found" in inbox.notes[0][1]
 
 
-def test_refund_from_an_anonymous_conversation_is_held():
+def test_a_refund_from_somebody_we_cannot_identify_is_answered_not_held():
+    """Asking who they are comes first.
+
+    This used to be held, which produced the worst of both: no charge could be
+    found, so the customer was told there were no payments on their account,
+    which was not true, and the request went to a colleague before anybody knew
+    whose it was. Money still cannot move either way, which is the part that
+    matters."""
     payments = FakePayments(charge())
     action, inbox, payments = run(
         conversation("refund", email=None), payments=payments, intent="refund"
     )
-    assert action == "flagged"
+    assert action == "answered"
     assert payments.refunded == []
+    assert inbox.notes == [], "nothing to escalate until we know who they are"
 
 
 def test_a_hedged_refund_never_moves_money():

@@ -919,9 +919,27 @@ NODES: dict[str, Callable[[State], State]] = {
     "hold": hold_node,
 }
 
+def wants_refund(state: State) -> bool:
+    """A refund request we are in a position to act on.
+
+    A refund asked for by somebody we cannot identify is not one yet. Sending it
+    down the refund path anyway produced the worst possible answer: no charge
+    could be found, so the customer was told there were no payments on their
+    account, which was not true, and the request was passed to a colleague
+    before anyone had established who they were.
+
+    Asking who they are is the answer to that, and the model has already written
+    it, so this stays on the answering path until there is somebody to look up.
+    """
+    assert state.proposal is not None
+    return state.proposal.refund_requested and bool(
+        identified_email(state.conversation)
+    )
+
+
 EDGES: dict[str, Callable[[State], str | None]] = {
-    # What the model asked for.
-    "understand": lambda s: "refund" if s.proposal.refund_requested else "answer",
+    # What the model asked for, once there is somebody to ask about.
+    "understand": lambda s: "refund" if wants_refund(s) else "answer",
     # What the policy allows. This edge is the money gate, and nothing the model
     # returned is consulted here beyond the rubric score the policy scores itself.
     "refund": lambda s: "execute_refund" if s.decision.auto_approve else "hold",
