@@ -129,44 +129,45 @@
       });
     })();
 
-    // Show only the choices that can still change the outcome.
+    // The amount and the date are hidden only when there is no payment to give
+    // them to. They stay for every other history, because they are not only
+    // refund inputs: the agent can look a payment up and talk about it, and
+    // "your payment of $90.00 on that date has already been refunded" is a real
+    // thing to demonstrate. Judging them by whether they change the refund
+    // outcome alone was too narrow.
     //
-    // refund_decision stops at the first check that fails, in this order:
-    // no charge, rubric, disputed, already refunded, more than one charge,
-    // amount, age, earlier refunds. So every history except "one payment,
-    // nothing refunded" is settled before the amount is ever looked at, and
-    // offering an amount there is worse than redundant: picking $90.00
-    // alongside "an earlier payment was refunded" trips the amount rule first
-    // and the earlier-refund rule never runs, so the demo silently shows
-    // something other than what was asked for.
-    //
-    // Same reasoning one level down: over the limit, the age is never reached.
+    // What they must not do is quietly contradict the label. refund_decision
+    // stops at the first check that fails, so a $90.00 payment with an earlier
+    // refund on the account trips the amount rule and never reaches the
+    // earlier-refund rule. Rather than forbid the combination, the line below
+    // works out which check really fires, in the same order the policy uses.
+    function firstFailure(history, amountCents, ageDays) {
+      if (history === "none") return "nothing on the account";
+      if (history === "disputed") return "disputed with the bank";
+      if (history === "refunded") return "already refunded";
+      if (history === "multiple") return "two payments to choose between";
+      if (amountCents > 5000) return "over the auto-approval limit";
+      if (ageDays > 30) return "outside the refund window";
+      if (history === "prior") return "an earlier refund on the account";
+      return null;
+    }
+
     function refreshFields() {
       var history = document.getElementById("history").value;
-      var amount = document.getElementById("amount").value;
-      var amountMatters = history === "clean";
-      var ageMatters = amountMatters && amount === "2000";
+      var amountCents = parseInt(document.getElementById("amount").value, 10);
+      var ageDays = parseInt(document.getElementById("age").value, 10);
 
-      document.getElementById("field-amount").hidden = !amountMatters;
-      document.getElementById("field-age").hidden = !ageMatters;
+      var hasPayment = history !== "none";
+      document.getElementById("field-amount").hidden = !hasPayment;
+      document.getElementById("field-age").hidden = !hasPayment;
 
-      var OUTCOME = {
-        refunded: "already refunded, so a colleague decides",
-        disputed: "disputed with the bank, so a colleague decides",
-        prior: "an earlier refund on the account, so a colleague decides",
-        multiple: "two payments to choose between, so a colleague decides",
-        none: "nothing on the account, so a colleague decides",
-      };
-      var outcome = OUTCOME[history];
-      if (!outcome) {
-        outcome =
-          amount !== "2000"
-            ? "over the auto-approval limit, so a colleague decides"
-            : document.getElementById("age").value !== "0"
-            ? "outside the refund window, so a colleague decides"
-            : "refunded automatically, with no person involved";
-      }
-      document.getElementById("expected").textContent = "Expect: " + outcome + ".";
+      var failed = firstFailure(history, amountCents, ageDays);
+      document.getElementById("expected").textContent =
+        "Expect: " +
+        (failed
+          ? failed + ", so a colleague decides"
+          : "refunded automatically, with no person involved") +
+        ".";
     }
 
     refreshFields();
