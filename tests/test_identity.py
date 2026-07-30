@@ -225,3 +225,43 @@ def test_a_conversation_that_never_registered_is_left_alone():
     from agent import announced
 
     assert announced("here you go", talking("hello")) == "here you go"
+
+
+# ------------------------------------- the address that does not depend on
+#                                       Chatwoot's uniqueness rules
+
+
+def test_the_registered_address_is_read_from_the_attribute():
+    """Chatwoot allows one contact per email and per identifier and will not
+    change an identifier once set, so a contact often cannot claim the address
+    its visitor registered with, and setUser fails without a word. Attributes
+    have no such rules, so that is where the address lives."""
+    from agent import EMAIL_ATTRIBUTE
+
+    conversation = talking(
+        "hello", contact=None, **{START_ATTRIBUTE: IDENTIFIED, EMAIL_ATTRIBUTE: MINE}
+    )
+    assert identified_email(conversation) == MINE
+
+
+def test_gating_compares_against_the_attribute_too():
+    from agent import EMAIL_ATTRIBUTE
+
+    ok = talking(
+        f"it is {MINE}",
+        contact=None,
+        **{START_ATTRIBUTE: ANONYMOUS, LOOKUP_ATTRIBUTE: GATED, EMAIL_ATTRIBUTE: MINE},
+    )
+    assert identified_email(ok) == MINE
+
+    other = talking(
+        f"it is {SOMEBODY_ELSE}",
+        contact=None,
+        **{START_ATTRIBUTE: ANONYMOUS, LOOKUP_ATTRIBUTE: GATED, EMAIL_ATTRIBUTE: MINE},
+    )
+    assert identified_email(other) is None
+
+
+def test_the_contact_record_is_still_used_when_there_is_no_attribute():
+    """Conversations from before this, and anything that never registered."""
+    assert identified_email(talking("hello")) == MINE

@@ -41,16 +41,18 @@ PORT = 8080
 
 
 def release_contact(config: dict[str, str], email: str) -> None:
-    """Delete this person's Chatwoot contact so the identity can be claimed again.
+    """Free this address so the browser coming back can claim it.
 
-    A reset clears the widget's cookie, so the browser returns as a brand new
-    contact and then tries to say who it is. Chatwoot allows one contact per
-    identifier and per email, and the old contact still holds both, so setUser
-    fails silently: the visitor stays anonymous, refunds stop matching, and
-    nothing anywhere says why.
+    Chatwoot keeps one contact per email and per identifier, and setUser against
+    one already taken fails without saying so: the visitor stays nameless, the
+    agent has nothing to check a stated address against, and the only symptom is
+    being asked for an address that is then refused.
 
-    This never came up while every reset invented a fresh address. It appears
-    the moment the address is one somebody typed and expects to keep.
+    Renamed rather than deleted, which matters more than it sounds. Deleting a
+    contact is a background job, and the page reloads and calls setUser within a
+    second, so the old contact was reliably still holding the address when the
+    new one tried to take it. Renaming is a plain update and has happened by the
+    time the request returns.
     """
     if not email:
         return
@@ -62,9 +64,22 @@ def release_contact(config: dict[str, str], email: str) -> None:
     found = client.get("/contacts/search", params={"q": email})
     if not found.is_success:
         return
+    stamp = int(time.time())
     for contact in found.json().get("payload", []):
-        if (contact.get("email") or "").lower() == email.lower():
-            client.delete(f"/contacts/{contact['id']}")
+        holds = (contact.get("email") or "").lower() == email.lower() or (
+            contact.get("identifier") or ""
+        ).lower() == email.lower()
+        if not holds:
+            continue
+        # .invalid is reserved by RFC 2606 and can never be a real address, so a
+        # released contact cannot collide with anybody registering later.
+        client.put(
+            f"/contacts/{contact['id']}",
+            json={
+                "email": f"released+{contact['id']}.{stamp}@example.invalid",
+                "identifier": f"released-{contact['id']}-{stamp}",
+            },
+        )
 
 
 def clear_queue(config: dict[str, str], email: str | None = None) -> int:

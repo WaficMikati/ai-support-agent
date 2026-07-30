@@ -321,11 +321,19 @@
 
       // How this conversation should behave, carried on the contact so one
       // shared instance can have every visitor set up differently.
+      // The address rides here, not on the contact record. Chatwoot will not
+      // let a second contact take an email or an identifier that another one
+      // holds, and will not change an identifier once set, so setUser is not
+      // something to depend on: it fails silently and often. Attributes have no
+      // such rules.
       window.$chatwoot.setCustomAttributes({
         demo_start: visitor.start,
         demo_lookup: visitor.lookup,
+        demo_email: visitor.email,
       });
 
+      // Still done, because a named contact is what makes the Chatwoot
+      // dashboard worth showing. Nothing depends on it working.
       // The contact is always the person who registered, whichever mode is on.
       // What changes is what the agent may do with it, and that is decided by
       // the attributes above rather than by hiding the record.

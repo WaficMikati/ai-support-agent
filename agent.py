@@ -640,6 +640,16 @@ class State:
 # every visitor set up differently rather than a single switch for the room.
 START_ATTRIBUTE = "demo_start"
 LOOKUP_ATTRIBUTE = "demo_lookup"
+# The address they registered with, carried here rather than read off the
+# contact record. Chatwoot allows one contact per email and per identifier and
+# will not change an identifier once set, so a returning visitor, or anybody
+# reusing an address, ends up on a contact that cannot claim it. setUser then
+# fails without a word: the visitor stays nameless, the agent has nothing to
+# check a stated address against, and the symptom is being asked for an address
+# that is then refused. Three separate bugs came from that before this stopped
+# depending on it. Custom attributes have no uniqueness rules and have landed
+# every time.
+EMAIL_ATTRIBUTE = "demo_email"
 
 # How the conversation begins.
 IDENTIFIED = "identified"  # we already know them, and say so
@@ -690,8 +700,10 @@ def identified_email(conversation: Conversation) -> str | None:
     already had.
     """
     settings = conversation.contact_attributes or {}
+    registered = str(settings.get(EMAIL_ATTRIBUTE, "")) or conversation.contact_email
+
     if str(settings.get(START_ATTRIBUTE, IDENTIFIED)) != ANONYMOUS:
-        return conversation.contact_email
+        return registered
 
     said = stated_email(conversation)
     if not said:
@@ -699,7 +711,7 @@ def identified_email(conversation: Conversation) -> str | None:
     if str(settings.get(LOOKUP_ATTRIBUTE, GATED)) == OPEN:
         return said
 
-    known = (conversation.contact_email or "").lower()
+    known = (registered or "").lower()
     return said if known and said.lower() == known else None
 
 
