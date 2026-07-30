@@ -163,6 +163,36 @@ def test_previous_refunds_flag_the_customer():
     assert "previous refund" in decision.reason
 
 
+def test_an_automatic_refund_records_why_it_was_allowed():
+    """The refusals already explain themselves. The approvals are where money
+    moved with nobody watching, so they are the ones worth being able to answer
+    for afterwards."""
+    inbox = FakeInbox()
+    handle_conversation(
+        conversation("I want my money back"),
+        inbox=inbox,
+        payments=FakePayments(charge()),
+        understand=understander("refund"),
+        knowledge="guidance",
+        now=NOW,
+    )
+    assert inbox.notes, "a refund that went through left no record of why"
+    note = inbox.notes[0][1]
+    assert "Refund issued automatically: 20.00" in note
+    assert "ch_1" in note and "re_fake_1" in note
+    assert "3 days old, limit 30" in note
+    assert "rubric" in note and "clear request: yes" in note
+
+
+def test_the_approval_note_quotes_the_limits_it_was_measured_against():
+    """So the note stays true if the constants are changed later."""
+    from agent import approval_note
+
+    note = approval_note(charge(), understander("refund")((), "", ()), "re_1", now=NOW)
+    assert f"limit {MAX_AUTO_REFUND_CENTS / 100:.2f}" in note
+    assert f"limit {MAX_CHARGE_AGE_DAYS}" in note
+
+
 def test_disputed_charge_is_never_auto_refunded():
     """Refunding on top of a dispute pays twice: the amount is already held, and
     the card network decides the case, not us."""
@@ -263,7 +293,10 @@ def test_qualifying_refund_goes_through_and_tells_the_customer():
     assert payments.refunded == ["ch_1"]
     assert len(inbox.replies) == 1
     assert "20.00" in inbox.replies[0][1]
-    assert inbox.notes == []
+    # One note, and it is the audit record rather than anything the customer
+    # sees. Covered in full by test_an_automatic_refund_records_why_it_was_allowed.
+    assert len(inbox.notes) == 1
+    assert inbox.notes[0][1].startswith("Refund issued automatically")
 
 
 def test_oversized_refund_is_held_and_never_charges_stripe():

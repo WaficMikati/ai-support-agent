@@ -479,6 +479,48 @@ def safe_holding_reply(reply: str) -> str:
     return reply
 
 
+def approval_note(
+    charge: Charge,
+    proposal: Proposal,
+    refund_id: str,
+    now: datetime | None = None,
+) -> str:
+    """Why a refund was allowed through, written where the refusals are written.
+
+    A refusal already left a note giving the check that failed, so the case a
+    person was going to look at anyway is the one that explains itself. The
+    approvals, where money moved with nobody watching, left only a line on
+    stdout that scrolls away and dies with the process.
+
+    That is the wrong way round. The question asked afterwards about an agent
+    that acts on its own is not "why did you escalate", it is "why did you
+    act", and the answer should be sitting next to the conversation rather than
+    reconstructed from Stripe by hand.
+
+    Every threshold is quoted next to what it was measured against, so the note
+    stays true if the constants are changed later.
+    """
+    now = now or datetime.now(timezone.utc)
+    age_days = (now - charge.created).days
+    amount = charge.amount_cents / 100
+    return "\n".join(
+        [
+            f"Refund issued automatically: {amount:.2f}",
+            f"Charge {charge.id}, refund {refund_id}",
+            "",
+            "Every check passed:",
+            f"  amount {amount:.2f}, limit {MAX_AUTO_REFUND_CENTS / 100:.2f}",
+            f"  {age_days} days old, limit {MAX_CHARGE_AGE_DAYS}",
+            f"  earlier refunds on the account: {charge.prior_refund_count}",
+            "  not already refunded",
+            "  not disputed",
+            f"  other refundable charges: {charge.sibling_unrefunded_count}",
+            f"  rubric {proposal.confidence:.2f}, minimum {MIN_CONFIDENCE}"
+            f" ({proposal.signals})",
+        ]
+    )
+
+
 def held_reply(reply: str, code: str = "") -> str:
     """What the customer is told when a person has to decide.
 
@@ -678,6 +720,11 @@ def execute_refund_node(state: State) -> State:
         state.conversation.id,
         f"That's refunded, {state.charge.amount_cents / 100:.2f} is on its way "
         "back to your original payment method. It usually lands within a few days.",
+    )
+    # The same record a refusal leaves, for the case where money actually moved.
+    state.inbox.add_private_note(
+        state.conversation.id,
+        approval_note(state.charge, state.proposal, refund_id, now=state.now),
     )
     state.inbox.resolve(state.conversation.id)
     state.action = "refunded"
