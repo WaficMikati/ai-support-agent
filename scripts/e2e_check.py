@@ -1,12 +1,13 @@
-"""End-to-end check: real Chatwoot, real OpenRouter, real Stripe test mode.
+"""End-to-end check: real Chatwoot, real model, real Stripe test mode.
 
 Every dependency is the live one. The model really classifies, Stripe really
 issues a refund, Chatwoot really receives the reply.
 
     uv run python scripts/e2e_check.py
 
-Needs .env with OPENROUTER_API_KEY, STRIPE_API_KEY, CHATWOOT_* and, for the
-refund scenarios, STRIPE_SETUP_KEY.
+Needs .env with MODEL_API_KEY, STRIPE_API_KEY, CHATWOOT_* and, for the refund
+scenarios, STRIPE_SETUP_KEY. The model is resolved exactly as agent.py does it,
+so this always checks the provider that is actually running.
 
 Why a second Stripe key: the agent's restricted key is deliberately
 Customers=Read, so it cannot create the customer and charge a refund test
@@ -27,10 +28,12 @@ sys.path.insert(0, str(ROOT))
 
 from agent import (  # noqa: E402
     MAX_AUTO_REFUND_CENTS,
-    ChatwootInbox,
     Brain,
+    ChatwootInbox,
     StripePayments,
+    env_value,
     handle_conversation,
+    load_env_file,
     refund_idempotency_key,
 )
 
@@ -189,11 +192,17 @@ def main() -> int:
     knowledge = (ROOT / env.get("KNOWLEDGE_FILE", "knowledge.md")).read_text()
     inbox = ChatwootInbox(base_url, account_id, token)
     payments = StripePayments(stripe_key)
+    # Resolve the model exactly as agent.py does, or this checks a different
+    # provider than the one actually running.
+    load_env_file(ROOT / ".env")
     brain = Brain(
-        env["OPENROUTER_API_KEY"],
-        model=env.get("OPENROUTER_MODEL", Brain.DEFAULT_MODEL),
-        base_url=env.get("OPENROUTER_BASE_URL", Brain.DEFAULT_BASE_URL),
+        env_value("MODEL_API_KEY", "OPENROUTER_API_KEY"),
+        model=env_value("MODEL_NAME", "OPENROUTER_MODEL", default=Brain.DEFAULT_MODEL),
+        base_url=env_value(
+            "MODEL_BASE_URL", "OPENROUTER_BASE_URL", default=Brain.DEFAULT_BASE_URL
+        ),
     )
+    print(f"  model: {brain._model} via {env_value('MODEL_BASE_URL', 'OPENROUTER_BASE_URL', default=Brain.DEFAULT_BASE_URL)}")
     admin = ChatwootAdmin(base_url, account_id, token, api_inbox)
     stamp = str(int(time.time()))
 
@@ -211,7 +220,7 @@ def main() -> int:
         raise AssertionError(f"conversation {conversation_id} not visible")
 
     # ---------------------------------------------------------- model only
-    print("\n1. the model classifies (real OpenRouter call)")
+    print("\n1. the model classifies (real call)")
     refund_call = brain.classify("I want my money back for the bootcamp")
     check("refund wording classified as refund", refund_call.intent == "refund",
           f"{refund_call.intent} @ {refund_call.confidence:.2f}")
@@ -314,7 +323,10 @@ def main() -> int:
         print("\n6. the same refund sent twice only moves money once")
         email = f"twice-{stamp}@example.com"
         charge_id = setup.customer_with_charge(email, 1_500)
-        key = refund_idempotency_key(999_001, 999_002)
+        # Unique per run. Stripe keeps keys for at least 24 hours and rejects a
+        # reused key that arrives with different parameters, so a fixed key here
+        # fails on the second run of the day against a different charge.
+        key = refund_idempotency_key(int(stamp), 1)
         first = payments.refund(charge_id, key)
         second = payments.refund(charge_id, key)
         check("Stripe returned the same refund both times", first == second,
