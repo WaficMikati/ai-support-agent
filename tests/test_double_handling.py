@@ -39,6 +39,11 @@ class FakeInbox:
     def send_reply(self, conversation_id, content):
         self.replies.append((conversation_id, content))
 
+    def send_choice(self, conversation_id, content, options):
+        self.replies.append((conversation_id, content))
+        self.offered = list(options)
+
+
     def add_private_note(self, conversation_id, content):
         self.notes.append((conversation_id, content))
 

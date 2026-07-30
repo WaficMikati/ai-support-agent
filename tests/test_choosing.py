@@ -59,6 +59,11 @@ class Inbox:
     def send_reply(self, conversation_id, content):
         self.replies.append(content)
 
+    def send_choice(self, conversation_id, content, options):
+        self.replies.append(content)
+        self.offered = list(options)
+
+
     def add_private_note(self, conversation_id, content):
         self.notes.append(content)
 
@@ -195,3 +200,44 @@ def test_why_not_reports_the_same_order_the_policy_uses():
 def test_a_disputed_payment_is_reported_as_disputed_not_as_refunded():
     both = charge(2_000, refunded=True, disputed=True)
     assert "disputed" in why_not(both, NOW)
+
+
+# ------------------------------------------------------------ tapping it
+
+
+def test_the_choice_is_offered_as_options_not_only_as_text():
+    """So nobody has to type an amount back at us."""
+    _, inbox, _ = act(said("I want a refund"), TWO)
+    assert len(inbox.offered) == 2
+    assert any("$20.00" in option for option in inbox.offered)
+    assert any("$35.00" in option for option in inbox.offered)
+
+
+def test_an_option_reads_as_something_the_matcher_understands():
+    """Whichever of title or value Chatwoot sends back when somebody taps, it
+    arrives as ordinary words, so tapping and typing are the same thing and
+    ignoring the buttons costs nothing."""
+    _, inbox, _ = act(said("I want a refund"), TWO)
+    for option in inbox.offered:
+        assert stated_choice(said(option), TWO) is not None, option
+
+
+def test_an_option_says_when_its_payment_cannot_be_refunded():
+    _, inbox, _ = act(said("I want a refund"), TWO)
+    assert any("outside the refund window" in option for option in inbox.offered)
+
+
+def test_a_date_can_be_named_as_well_as_an_amount():
+    """The list shows both, so people refer to either. Picking by date used to
+    ask the same question again."""
+    assert stated_choice(said("the 31st of may one"), TWO).id == "ch_3500"
+    assert stated_choice(said("30 July"), TWO).id == "ch_2000"
+    assert stated_choice(said("the 31st"), TWO).id == "ch_3500"
+
+
+def test_a_day_with_the_wrong_month_is_not_a_choice():
+    assert stated_choice(said("the 31st of March one"), TWO) is None
+
+
+def test_a_month_on_its_own_settles_nothing():
+    assert stated_choice(said("the may one"), TWO) is None

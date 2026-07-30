@@ -280,6 +280,9 @@ class Inbox(Protocol):
     def open_conversations(self) -> list[Conversation]: ...
     def with_history(self, conversation: Conversation) -> Conversation: ...
     def send_reply(self, conversation_id: int, content: str) -> None: ...
+    def send_choice(
+        self, conversation_id: int, content: str, options: Sequence[str]
+    ) -> None: ...
     def add_private_note(self, conversation_id: int, content: str) -> None: ...
     def resolve(self, conversation_id: int) -> None: ...
     def record_handled(self, conversation_id: int, message_id: int) -> None: ...
@@ -764,6 +767,13 @@ def announced(reply: str, conversation: Conversation) -> str:
 
 
 AMOUNT_PATTERN = re.compile(r"\d+(?:[.,]\d{1,2})?")
+# A day, written how people write it: "23", "23rd", "the 23rd of July".
+DAY_PATTERN = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\b")
+MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+}
 NEWEST_WORDS = ("most recent", "latest", "newest", "last one", "recent one")
 OLDEST_WORDS = ("oldest", "earliest", "first one")
 
@@ -796,8 +806,10 @@ def stated_choice(
     if any(word in said for word in OLDEST_WORDS):
         return charges[-1]
 
-    # An amount, which is how people actually refer to a payment. Anything
-    # matching more than one charge is no use, so it is left undecided.
+    # An amount or a date, which are the two things the list shows and so the
+    # two ways anybody refers to one of them. Both are collected before deciding,
+    # because the answer has to name exactly one payment either way: a number
+    # that is an amount here and a day there has settled nothing.
     wanted = set()
     for found in AMOUNT_PATTERN.findall(said):
         figure = found.replace(",", ".")
@@ -809,7 +821,21 @@ def stated_choice(
             # "20" means twenty of something, not twenty cents.
             wanted.add(int(figure) * 100)
 
-    matched = [charge for charge in charges if charge.amount_cents in wanted]
+    days = {int(day) for day in DAY_PATTERN.findall(said) if 1 <= int(day) <= 31}
+    months = {number for name, number in MONTHS.items() if name in said}
+    months |= {number for name, number in MONTHS.items() if name[:3] in said.split()}
+
+    matched = []
+    for charge in charges:
+        by_amount = charge.amount_cents in wanted
+        # A month on its own is not a choice, and a day with the wrong month
+        # beside it is somebody talking about something else.
+        by_date = charge.created.day in days and (
+            not months or charge.created.month in months
+        )
+        if by_amount or by_date:
+            matched.append(charge)
+
     return matched[0] if len(matched) == 1 else None
 
 
@@ -1015,6 +1041,20 @@ def hold_node(state: State) -> State:
     return state
 
 
+def choice_label(charge: Charge, now: datetime | None = None) -> str:
+    """One payment as a button, and as something the matcher already reads.
+
+    Amount and date both, because that is what makes two payments tellable
+    apart, and because whichever of the two Chatwoot sends back when somebody
+    taps it lands in the conversation as ordinary words.
+    """
+    stops = why_not(charge, now)
+    return (
+        f"{money(charge.amount_cents, charge.currency)} on {charge.created:%d %B %Y}"
+        + (f" ({stops})" if stops else "")
+    )
+
+
 def choose_node(state: State) -> State:
     """Show the payments and ask which one, instead of handing it to a person.
 
@@ -1026,7 +1066,8 @@ def choose_node(state: State) -> State:
     Written here rather than by the model because it lists amounts and dates,
     and left open because it is a question, not a hand-off.
     """
-    state.inbox.send_reply(
+    options = [choice_label(charge, state.now) for charge in state.charges]
+    state.inbox.send_choice(
         state.conversation.id,
         announced(
             "I can see more than one payment, so I would rather not guess.\n\n"
@@ -1034,6 +1075,7 @@ def choose_node(state: State) -> State:
             + "\n\nWhich would you like refunded?",
             state.conversation,
         ),
+        options,
     )
     state.action = "asked which"
     return state
@@ -1244,6 +1286,35 @@ class ChatwootInbox:
             template=item.get("message_type") == 3,
         )
 
+    @staticmethod
+    def _with_taps(entries: Sequence[dict]) -> list[Message]:
+        """The messages, with any tapped option turned into a customer turn.
+
+        Tapping one of the buttons on a question does not send a message.
+        Chatwoot records it as `submitted_values` on the question itself, which
+        is one of ours, so who spoke last never changes and the conversation
+        simply stops: the customer has answered and the agent is still waiting.
+
+        The answer is added as an incoming message so that everything after this
+        can treat tapping and typing as the same thing. It is given the negative
+        of the question's id, which is unique, stable across polls, and cannot
+        collide with a real one, so acting on it twice is prevented by exactly
+        the same means as any other message.
+        """
+        built: list[Message] = []
+        for item in entries:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            built.append(ChatwootInbox._message(item))
+            chosen = (item.get("content_attributes") or {}).get("submitted_values")
+            for pick in chosen or []:
+                said = (pick or {}).get("value") or (pick or {}).get("title") or ""
+                if said:
+                    built.append(
+                        Message(id=-int(item["id"]), content=said, incoming=True)
+                    )
+        return built
+
     def _conversation(self, entry: dict) -> Conversation:
         """One conversation, fetching its messages only when it has to.
 
@@ -1267,11 +1338,7 @@ class ChatwootInbox:
         contact = (entry.get("meta") or {}).get("sender") or {}
         attributes = entry.get("custom_attributes") or {}
         handled = attributes.get(HANDLED_ATTRIBUTE)
-        newest = [
-            self._message(item)
-            for item in (entry.get("messages") or [])
-            if isinstance(item, dict) and "id" in item
-        ]
+        newest = self._with_taps(entry.get("messages") or [])
 
         usable = bool(newest) and not (newest[-1].activity or newest[-1].template)
         messages = tuple(newest) if usable else self._all_messages(conversation_id)
@@ -1281,7 +1348,9 @@ class ChatwootInbox:
             contact_email=contact.get("email"),
             contact_attributes=contact.get("custom_attributes") or {},
             messages=messages,
-            handled_message_id=int(handled) if str(handled).isdigit() else None,
+            handled_message_id=(
+                int(handled) if str(handled).lstrip("-").isdigit() else None
+            ),
             # The fallback fetched everything, so in that case it is already whole.
             history_complete=not usable,
         )
@@ -1306,10 +1375,30 @@ class ChatwootInbox:
     def _all_messages(self, conversation_id: int) -> tuple[Message, ...]:
         response = self._client.get(f"/conversations/{conversation_id}/messages")
         response.raise_for_status()
-        return tuple(self._message(item) for item in response.json()["payload"])
+        return tuple(self._with_taps(response.json()["payload"]))
 
     def send_reply(self, conversation_id: int, content: str) -> None:
         self._post(conversation_id, content, private=False)
+
+    def send_choice(
+        self, conversation_id: int, content: str, options: Sequence[str]
+    ) -> None:
+        """A question with the answers as buttons, so nobody has to type one.
+
+        Each option carries its own label as its value, so whichever of the two
+        Chatwoot sends back when somebody taps it is a sentence the choice
+        matcher already reads. Tapping and typing then arrive as the same thing,
+        which also means a customer who ignores the buttons is no worse off.
+        """
+        self._post(
+            conversation_id,
+            content,
+            private=False,
+            content_type="input_select",
+            content_attributes={
+                "items": [{"title": option, "value": option} for option in options]
+            },
+        )
 
     def add_private_note(self, conversation_id: int, content: str) -> None:
         self._post(conversation_id, content, private=True)
@@ -1335,13 +1424,14 @@ class ChatwootInbox:
         )
         response.raise_for_status()
 
-    def _post(self, conversation_id: int, content: str, *, private: bool) -> None:
+    def _post(self, conversation_id: int, content: str, *, private: bool, **extra) -> None:
         response = self._client.post(
             f"/conversations/{conversation_id}/messages",
             json={
                 "content": content,
                 "message_type": "outgoing",
                 "private": private,
+                **extra,
             },
         )
         response.raise_for_status()

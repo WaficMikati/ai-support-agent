@@ -156,3 +156,58 @@ def test_requests_carry_the_access_token():
     client, seen = inbox_for([INCOMING])
     client.open_conversations()
     assert all(r.headers["api_access_token"] == TOKEN for r in seen)
+
+
+# ------------------------------------------------- tapping one of the buttons
+
+
+def tapped(chosen: str) -> dict:
+    """The question we asked, after somebody tapped an answer on it."""
+    return {
+        "id": 42,
+        "content": "Which would you like refunded?",
+        "message_type": 1,
+        "content_type": "input_select",
+        "content_attributes": {
+            "items": [{"title": chosen, "value": chosen}],
+            "submitted_values": [{"title": chosen, "value": chosen}],
+        },
+    }
+
+
+def test_a_tapped_option_becomes_something_the_customer_said():
+    """Tapping sends no message. Chatwoot writes it onto the question, which is
+    ours, so without this who spoke last never changes and the conversation
+    stops with the customer having already answered."""
+    inbox, _ = inbox_for([tapped("$20.00 on 30 July 2026")])
+    conversation = inbox.open_conversations()[0]
+    assert conversation.latest is not None
+    assert conversation.latest.incoming, "the tap is the customer's turn"
+    assert conversation.latest.content == "$20.00 on 30 July 2026"
+
+
+def test_a_tap_needs_a_reply():
+    inbox, _ = inbox_for([tapped("$20.00 on 30 July 2026")])
+    assert needs_reply(inbox.open_conversations()[0])
+
+
+def test_a_tap_reads_as_a_turn_the_model_can_see():
+    inbox, _ = inbox_for([tapped("$35.00 on 23 July 2026")])
+    turns = inbox.open_conversations()[0].turns()
+    assert turns[-1].role == "user"
+    assert turns[-1].content == "$35.00 on 23 July 2026"
+
+
+def test_an_untouched_question_is_still_only_ours():
+    waiting = tapped("$20.00 on 30 July 2026")
+    del waiting["content_attributes"]["submitted_values"]
+    inbox, _ = inbox_for([waiting])
+    assert not needs_reply(inbox.open_conversations()[0]), "nobody has answered yet"
+
+
+def test_a_tap_gets_an_id_that_cannot_collide_with_a_real_message():
+    """Acting on it twice is prevented by the same means as anything else, so
+    the id has to be unique and the same on every poll."""
+    inbox, _ = inbox_for([tapped("$20.00 on 30 July 2026")])
+    messages = inbox.open_conversations()[0].messages
+    assert [m.id for m in messages] == [42, -42]
