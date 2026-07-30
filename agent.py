@@ -188,6 +188,33 @@ class Charge:
     # mean. Customers rarely say which payment they are talking about, so more
     # than one candidate is treated as a question for a human, not a guess.
     sibling_unrefunded_count: int = 0
+    # Stripe's three-letter code, lowercase. Carried so an amount can be written
+    # with its currency rather than as a bare number, which reads as dollars to
+    # anybody who was charged in euros.
+    currency: str = "usd"
+
+
+# Stripe holds most amounts in the smallest unit, so 2000 is $20.00. A few
+# currencies have no minor unit at all and 2000 means 2000, and dividing those
+# by a hundred understates a refund by two orders of magnitude.
+ZERO_DECIMAL = frozenset(
+    {"bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg",
+     "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf"}
+)
+CURRENCY_SYMBOLS = {"usd": "$", "eur": "€", "gbp": "£", "jpy": "¥"}
+
+
+def money(amount: int, currency: str = "usd") -> str:
+    """An amount as a person would read it.
+
+    Written out rather than left bare because "20.00" reads as dollars to
+    whoever is looking at it, which is only true by accident. Currencies without
+    a familiar symbol get their code after the number instead of a guessed one.
+    """
+    code = (currency or "usd").lower()
+    figure = f"{amount:,}" if code in ZERO_DECIMAL else f"{amount / 100:,.2f}"
+    symbol = CURRENCY_SYMBOLS.get(code)
+    return f"{symbol}{figure}" if symbol else f"{figure} {code.upper()}"
 
 
 @dataclass(frozen=True)
@@ -329,8 +356,8 @@ def refund_decision(
     if charge.amount_cents > MAX_AUTO_REFUND_CENTS:
         return Decision(
             False,
-            f"amount {charge.amount_cents / 100:.2f} over the "
-            f"{MAX_AUTO_REFUND_CENTS / 100:.2f} auto-approval limit",
+            f"amount {money(charge.amount_cents, charge.currency)} over the "
+            f"{money(MAX_AUTO_REFUND_CENTS, charge.currency)} auto-approval limit",
             "too_large",
         )
 
@@ -502,14 +529,14 @@ def approval_note(
     """
     now = now or datetime.now(timezone.utc)
     age_days = (now - charge.created).days
-    amount = charge.amount_cents / 100
+    amount = money(charge.amount_cents, charge.currency)
     return "\n".join(
         [
-            f"Refund issued automatically: {amount:.2f}",
+            f"Refund issued automatically: {amount}",
             f"Charge {charge.id}, refund {refund_id}",
             "",
             "Every check passed:",
-            f"  amount {amount:.2f}, limit {MAX_AUTO_REFUND_CENTS / 100:.2f}",
+            f"  amount {amount}, limit {money(MAX_AUTO_REFUND_CENTS, charge.currency)}",
             f"  {age_days} days old, limit {MAX_CHARGE_AGE_DAYS}",
             f"  earlier refunds on the account: {charge.prior_refund_count}",
             "  not already refunded",
@@ -614,7 +641,7 @@ def describe_charge(charge: Charge | None) -> str:
         return "This account has no payments on record. There is nothing to show."
 
     said = [
-        f"Most recent payment: {charge.amount_cents / 100:.2f} "
+        f"Most recent payment: {money(charge.amount_cents, charge.currency)} "
         f"on {charge.created:%d %B %Y}."
     ]
     # Only worth saying when it is true. Told a payment "has not been refunded"
@@ -720,7 +747,7 @@ def execute_refund_node(state: State) -> State:
     # Written here rather than by the model, because it states an amount.
     state.inbox.send_reply(
         state.conversation.id,
-        f"That's refunded, {state.charge.amount_cents / 100:.2f} is on its way "
+        f"That's refunded, {money(state.charge.amount_cents, state.charge.currency)} is on its way "
         "back to your original payment method. It usually lands within a few days.",
     )
     # The same record a refusal leaves, for the case where money actually moved.
@@ -1220,6 +1247,7 @@ class StripePayments:
             prior_refund_count=prior_refund_count - (0 if untouched else 1),
             sibling_unrefunded_count=siblings,
             disputed=bool(target.get("disputed")),
+            currency=str(target.get("currency") or "usd"),
         )
 
     @staticmethod

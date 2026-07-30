@@ -326,3 +326,51 @@ def test_the_charge_id_is_never_shown():
     """Meaningless to a customer, and anything in front of the model can be
     quoted back to them."""
     assert "ch_1" not in describe_charge(charge())
+
+
+# ------------------------------------------------------------- writing money
+
+
+def test_dollars_get_a_dollar_sign():
+    from agent import money
+
+    assert money(2_000) == "$20.00"
+    assert money(2_000, "usd") == "$20.00"
+
+
+def test_other_familiar_currencies_get_their_symbol():
+    from agent import money
+
+    assert money(2_000, "eur") == "€20.00"
+    assert money(2_000, "gbp") == "£20.00"
+
+
+def test_an_unfamiliar_currency_gets_its_code_rather_than_a_guessed_symbol():
+    from agent import money
+
+    assert money(2_000, "cad") == "20.00 CAD"
+
+
+def test_a_currency_without_minor_units_is_not_divided():
+    """Stripe holds most amounts in the smallest unit, but yen has no minor
+    unit, so 2000 means 2000. Dividing understates a refund a hundredfold."""
+    from agent import money
+
+    assert money(2_000, "jpy") == "¥2,000"
+    assert money(2_000, "krw") == "2,000 KRW"
+
+
+def test_large_amounts_are_grouped():
+    from agent import money
+
+    assert money(1_234_567) == "$12,345.67"
+
+
+def test_a_missing_currency_falls_back_to_dollars():
+    from agent import money
+
+    assert money(2_000, "") == "$20.00"
+
+
+def test_the_amount_the_customer_is_shown_carries_its_currency():
+    assert "€20.00" in describe_charge(charge(currency="eur"))

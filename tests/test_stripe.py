@@ -20,6 +20,7 @@ def charge_json(
     created=NOW_TS,
     disputed=False,
     metadata=None,
+    currency="usd",
 ):
     return {
         "id": charge_id,
@@ -29,6 +30,7 @@ def charge_json(
         "amount_refunded": amount_refunded,
         "disputed": disputed,
         "metadata": metadata or {},
+        "currency": currency,
     }
 
 
@@ -208,3 +210,20 @@ def test_lookup_never_writes():
     payments, seen = payments_for([charge_json("ch_1")])
     payments.latest_charge("a@b.com")
     assert [r.method for r in seen] == ["GET", "GET"], "reading must not POST"
+
+
+# ----------------------------------------------------------------- currency
+
+
+def test_the_currency_is_carried_through():
+    payments, _ = payments_for([charge_json("ch_1", currency="eur")])
+    charge = payments.latest_charge("a@b.com")
+    assert charge is not None and charge.currency == "eur"
+
+
+def test_a_charge_without_a_currency_is_assumed_to_be_dollars():
+    """Rather than crashing on a field Stripe always sends but a fake might not."""
+    payments, _ = payments_for([{"id": "ch_1", "amount": 2_000, "created": NOW_TS,
+                                 "refunded": False, "amount_refunded": 0}])
+    charge = payments.latest_charge("a@b.com")
+    assert charge is not None and charge.currency == "usd"

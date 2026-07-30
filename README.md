@@ -462,11 +462,11 @@ which is backwards: the approvals are where money moved with nobody watching.
 Both now leave a private note. An approved one reads:
 
 ```
-Refund issued automatically: 20.00
-Charge ch_3Tywpa…, refund re_3Tywpa…
+Refund issued automatically: $20.00
+Charge ch_3Tyxbi…, refund re_3Tyxbi…
 
 Every check passed:
-  amount 20.00, limit 50.00
+  amount $20.00, limit $50.00
   0 days old, limit 30
   earlier refunds on the account: 0
   not already refunded
@@ -614,6 +614,7 @@ than tokens, which is roomier for this shape of workload.
 |---|---|
 | Tone, when to ask a follow-up | `knowledge.md` — takes effect within seconds |
 | The facts it may state | Articles in your Chatwoot help centre |
+| How amounts are written | `money()` and `CURRENCY_SYMBOLS` in `agent.py` |
 | Refund thresholds | The constants at the top of `agent.py` |
 | What a held refund says | `HELD_EXPLANATIONS` in `agent.py` |
 | What it can look up | `TOOL_SPECS` and `account_tools` — read-only, no arguments |

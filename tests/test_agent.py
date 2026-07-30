@@ -178,7 +178,7 @@ def test_an_automatic_refund_records_why_it_was_allowed():
     )
     assert inbox.notes, "a refund that went through left no record of why"
     note = inbox.notes[0][1]
-    assert "Refund issued automatically: 20.00" in note
+    assert "Refund issued automatically: $20.00" in note
     assert "ch_1" in note and "re_fake_1" in note
     assert "3 days old, limit 30" in note
     assert "rubric" in note and "clear request: yes" in note
@@ -188,8 +188,10 @@ def test_the_approval_note_quotes_the_limits_it_was_measured_against():
     """So the note stays true if the constants are changed later."""
     from agent import approval_note
 
+    from agent import money
+
     note = approval_note(charge(), understander("refund")((), "", ()), "re_1", now=NOW)
-    assert f"limit {MAX_AUTO_REFUND_CENTS / 100:.2f}" in note
+    assert f"limit {money(MAX_AUTO_REFUND_CENTS)}" in note
     assert f"limit {MAX_CHARGE_AGE_DAYS}" in note
 
 
