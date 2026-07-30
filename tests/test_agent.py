@@ -102,7 +102,7 @@ def understander(
 ):
     """Stands in for the model: proposes a reply and whether a refund is asked
     for."""
-    return lambda turns, knowledge, articles=(): Proposal(
+    return lambda turns, knowledge, articles=(), tools=None: Proposal(
         reply=text,
         refund_requested=intent == "refund",
         clear_request=clear,
@@ -269,7 +269,7 @@ def test_a_held_refund_still_tells_the_customer_something():
     assert len(inbox.replies) == 1, "the customer must not be left in silence"
 
 
-def test_a_held_refund_uses_the_reply_the_model_wrote():
+def test_a_held_refund_keeps_the_reply_the_model_wrote():
     """So a message that asked two things gets both addressed, rather than a
     fixed sentence about refunds only."""
     payments = FakePayments(charge(amount_cents=90_000))
@@ -282,7 +282,25 @@ def test_a_held_refund_uses_the_reply_the_model_wrote():
         knowledge="guidance",
         now=NOW,
     )
-    assert inbox.replies[0][1] == "I have cancelled your subscription."
+    assert inbox.replies[0][1].startswith("I have cancelled your subscription.")
+
+
+def test_a_held_refund_always_says_what_happens_next():
+    """The customer is owed the same commitment every time, so it is written
+    here rather than left to whatever the model happened to say."""
+    payments = FakePayments(charge(amount_cents=90_000))
+    inbox = FakeInbox()
+    handle_conversation(
+        conversation("refund please"),
+        inbox=inbox,
+        payments=payments,
+        understand=understander("refund", text="Sorry about that."),
+        knowledge="guidance",
+        now=NOW,
+    )
+    reply = inbox.replies[0][1]
+    assert "sent your refund request to my colleague for review" in reply
+    assert "within the next 24 hours" in reply
 
 
 def test_a_held_refund_never_tells_the_customer_money_is_coming():

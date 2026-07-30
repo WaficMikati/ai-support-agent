@@ -70,7 +70,7 @@ class ExplodingBrain:
     def __init__(self):
         self.calls = 0
 
-    def __call__(self, turns, knowledge, articles=()):
+    def __call__(self, turns, knowledge, articles=(), tools=None):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("model API returned 503")
@@ -107,7 +107,7 @@ def act(conv, handled, *, inbox=None, payments=None, intent="support", brain=Non
         payments=payments,
         understand=brain
         or (
-            lambda turns, knowledge, articles=(): Proposal(
+            lambda turns, knowledge, articles=(), tools=None: Proposal(
                 reply="answer",
                 refund_requested=intent == "refund",
                 clear_request=True,
@@ -207,7 +207,7 @@ def test_the_loop_shares_one_set_across_passes():
     common = dict(
         inbox=inbox,
         payments=FakePayments(charge()),
-        understand=lambda turns, knowledge, articles=(): Proposal(
+        understand=lambda turns, knowledge, articles=(), tools=None: Proposal(
             reply="answer",
             refund_requested=False,
             clear_request=True,

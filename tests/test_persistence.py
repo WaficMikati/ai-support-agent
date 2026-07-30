@@ -68,7 +68,7 @@ class FakePayments:
 
 
 def understander(reply="here you go"):
-    return lambda turns, knowledge, articles=(): Proposal(
+    return lambda turns, knowledge, articles=(), tools=None: Proposal(
         reply=reply,
         refund_requested=False,
         clear_request=True,

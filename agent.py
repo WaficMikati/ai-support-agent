@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 import httpx
 
@@ -248,12 +248,19 @@ class Payments(Protocol):
     def refund(self, charge_id: str, idempotency_key: str) -> str: ...
 
 
+# What the model may call while it is working something out. No arguments by
+# design: the caller binds who the lookup is about, so the model chooses whether
+# to look, never whose record to look at.
+ToolFunction = Callable[[], str]
+
+
 class Understander(Protocol):
     def __call__(
         self,
         turns: Sequence[Turn],
         knowledge: str,
         articles: Sequence[Article],
+        tools: Mapping[str, ToolFunction] | None = None,
     ) -> Proposal: ...
 
 
@@ -377,6 +384,15 @@ HOLDING_REPLY = (
     "at your refund and come back to you shortly."
 )
 
+# Appended to whatever the model wrote, rather than replacing it, so a message
+# that asked two things still gets both answered. Written here and not by the
+# model because it is a commitment: somebody has to actually reply within a day
+# for it to be true, which is not the model's to promise.
+ESCALATION_NOTICE = (
+    "I have sent your refund request to my colleague for review. You should "
+    "receive an email within the next 24 hours."
+)
+
 # Phrases that would tell a customer their money is on the way. Deliberately
 # blunt: this only has to catch a model that ignored the instruction not to
 # promise an outcome, and a false positive costs nothing but a plainer reply.
@@ -399,6 +415,17 @@ def safe_holding_reply(reply: str) -> str:
         log.warning("proposal promised a refund before approval, using safe wording")
         return HOLDING_REPLY
     return reply
+
+
+def held_reply(reply: str) -> str:
+    """What the customer is told when a person has to decide.
+
+    The model's own words first, so anything else they asked is still answered,
+    then the one sentence that must always be there. Guaranteed rather than
+    hoped for: the model was told not to promise an outcome, and this is what
+    the customer is owed instead.
+    """
+    return f"{safe_holding_reply(reply).rstrip()}\n\n{ESCALATION_NOTICE}"
 
 
 def retrieval_query(turns: Sequence[Turn]) -> str:
@@ -466,6 +493,46 @@ class State:
 # --------------------------------------------------------------------------
 
 
+def describe_charge(charge: Charge | None) -> str:
+    """A payment as a sentence, for the model to read.
+
+    Deliberately no charge id: it is meaningless to the customer, and anything
+    put in front of the model can end up quoted back to them.
+    """
+    if charge is None:
+        return "No payment was found for this customer."
+
+    said = [
+        f"Most recent payment: {charge.amount_cents / 100:.2f} "
+        f"on {charge.created:%d %B %Y}."
+    ]
+    said.append(
+        "It has already been refunded."
+        if charge.refunded
+        else "It has not been refunded."
+    )
+    if charge.sibling_unrefunded_count:
+        said.append(
+            f"There are {charge.sibling_unrefunded_count} other unrefunded "
+            "payments on this account."
+        )
+    return " ".join(said)
+
+
+def account_tools(state: State) -> dict[str, ToolFunction]:
+    """What the model may look up for this particular customer.
+
+    Every tool closes over the conversation's own contact, so the customer it
+    reads about is fixed here and cannot be steered by anything said in the
+    chat. If Chatwoot has no email for them there is nothing to look up, and
+    offering the tool anyway would invite an answer built on a failed lookup.
+    """
+    email = state.conversation.contact_email
+    if not email:
+        return {}
+    return {"get_last_purchase": lambda: describe_charge(state.payments.latest_charge(email))}
+
+
 def understand_node(state: State) -> State:
     """Read the conversation, fetch anything relevant, propose a reply."""
     turns = state.conversation.turns()
@@ -480,7 +547,9 @@ def understand_node(state: State) -> State:
             ", ".join(article.title for article in articles),
         )
 
-    state.proposal = state.understand(turns, state.knowledge, state.articles)
+    state.proposal = state.understand(
+        turns, state.knowledge, state.articles, account_tools(state)
+    )
     log.info(
         "conversation %s: refund_requested=%s (%.2f) over %s turns",
         state.conversation.id,
@@ -556,7 +625,7 @@ def hold_node(state: State) -> State:
     # safe wording replaces it: the customer must not be told their money is
     # coming back when a human has not agreed to it.
     state.inbox.send_reply(
-        state.conversation.id, safe_holding_reply(state.proposal.reply)
+        state.conversation.id, held_reply(state.proposal.reply)
     )
     # Deliberately left open, and not resolved: a person still has to act.
     state.inbox.add_private_note(
@@ -1100,6 +1169,40 @@ Respond with a single JSON object and nothing else, of exactly this shape:
 {"reply": "...", "refund_requested": true, "clear_request": true,
  "charge_identified": false, "hedging": false}"""
 
+# Read-only, and every one of them takes no arguments. That is the security
+# property, not a simplification: a tool that accepted an email address would
+# let the model pass along whatever the customer typed, and anyone could read a
+# stranger's payment history by naming their address. Who the customer is comes
+# from Chatwoot's contact record, which the widget set when they signed in, and
+# the model never gets to choose it.
+#
+# Nothing that moves money is here either. The model can look a payment up and
+# talk about it; whether a refund happens is still settled by refund_decision,
+# in code, after it has finished.
+TOOL_SPECS: dict[str, dict] = {
+    "get_last_purchase": {
+        "type": "function",
+        "function": {
+            "name": "get_last_purchase",
+            "description": (
+                "Look up this customer's most recent payment: the amount, the "
+                "date, and whether any of it has already been refunded. Use it "
+                "whenever they ask about what they paid, when, or how much. "
+                "Takes no arguments: the customer is already identified."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+}
+
+TOOL_GUIDANCE = """You can look things up before answering.
+
+Call a tool when the customer asks about their own account rather than about
+the product in general. Do not ask them for details a tool can give you, and
+do not ask them to confirm who they are: they are signed in.
+
+When you have what you need, stop calling tools."""
+
 
 class Brain:
     """The model, over OpenRouter.
@@ -1160,18 +1263,25 @@ class Brain:
             transport=transport,
         )
 
+    # Three rounds is enough for "look it up, then answer" with room to spare,
+    # and it is a ceiling rather than a target: the loop stops as soon as the
+    # model answers instead of calling something. Without a bound, a model that
+    # keeps asking for the same tool never returns.
+    MAX_TOOL_ROUNDS = 3
+
     def understand(
         self,
         turns: Sequence[Turn],
         knowledge: str,
         articles: Sequence[Article] = (),
+        tools: Mapping[str, ToolFunction] | None = None,
     ) -> Proposal:
         """Read the conversation and propose the next reply.
 
-        One call, given the thread rather than a single message, returning both
-        the reply and whether a refund is being requested. It is a proposal: the
-        thresholds that decide whether money actually moves are applied
-        afterwards, in code, and are never shown to the model.
+        Given the thread rather than a single message, returning both the reply
+        and whether a refund is being requested. It is a proposal: the thresholds
+        that decide whether money actually moves are applied afterwards, in code,
+        and are never shown to the model.
 
         This replaced a classify-then-branch design, where each message was
         reduced to one of two labels before anything was understood. That shape
@@ -1179,34 +1289,65 @@ class Brain:
         pushed every distinction into the rubric: "how do I get a refund?" was
         read as a request and refunded twenty dollars until an example was added
         forbidding it. The list of such examples has no end.
+
+        Two phases when tools are offered, because Groq rejects `tools` and
+        `response_format` in one request outright:
+
+            json mode cannot be combined with tool/function calling
+
+        So the model is first allowed to look things up, and only then asked for
+        the proposal, with whatever it found already in the conversation. The
+        two-phase shape is kept even where a provider would allow one call: a
+        second path that only some providers exercise is a second path that
+        breaks unnoticed.
+
+        It is not free. Offering tools costs two calls per message even when
+        nothing is looked up, and three when something is, because the gathering
+        phase has to be told it is finished. Worth knowing against a rate limit:
+        a conversation is roughly twice the requests it used to be. When no tools
+        are offered it stays at one call.
         """
-        system = [
+        base = [
             "You are a customer support agent for a subscription business.",
             "",
             "How to behave:",
             knowledge,
         ]
         if articles:
-            system += [
+            base += [
                 "",
                 "Documentation you may state as fact. Anything specific about the "
                 "product, its prices or its policies must come from here. Do not "
                 "add details that are not written below.",
                 "",
             ]
-            system += [f"## {a.title}\n{a.content}" for a in articles]
+            base += [f"## {a.title}\n{a.content}" for a in articles]
         else:
-            system += [
+            base += [
                 "",
                 "No documentation matched this conversation, so state nothing "
                 "specific about the product, its prices or its policies. Answer "
                 "generally if the question does not need them, otherwise say a "
                 "colleague will follow up.",
             ]
-        system += ["", UNDERSTAND_RULES]
 
-        messages = [{"role": "system", "content": "\n".join(system)}]
-        messages += [{"role": t.role, "content": t.content} for t in turns]
+        conversation = [{"role": t.role, "content": t.content} for t in turns]
+        specs = [TOOL_SPECS[name] for name in (tools or {}) if name in TOOL_SPECS]
+        if specs:
+            # The gathering phase is deliberately not told to answer in JSON.
+            # Asked for a strict object and offered tools in the same breath, the
+            # model tends to produce the object immediately and never look
+            # anything up.
+            gathered = self._gather(
+                [{"role": "system", "content": "\n".join(base + ["", TOOL_GUIDANCE])}]
+                + conversation,
+                specs,
+                tools or {},
+            )
+            conversation = gathered[1:]
+
+        messages = [{"role": "system", "content": "\n".join(base + ["", UNDERSTAND_RULES])}]
+        messages += conversation
 
         last_payload = ""
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
@@ -1229,6 +1370,46 @@ class Brain:
             f"model did not return a usable proposal after {self.MAX_ATTEMPTS} "
             f"attempts. Last reply: {last_payload[:300]}"
         )
+
+    def _gather(
+        self,
+        messages: list[dict],
+        specs: list[dict],
+        tools: Mapping[str, ToolFunction],
+    ) -> list[dict]:
+        """Let the model look things up, and return the conversation it built.
+
+        Bounded, and it stops early the moment the model answers rather than
+        calling something, which is the usual case: most questions need no
+        lookup at all.
+        """
+        for round_number in range(1, self.MAX_TOOL_ROUNDS + 1):
+            message = self._chat_message(
+                messages, tools=specs, **self._provider_preferences()
+            )
+            calls = message.get("tool_calls") or []
+            if not calls:
+                return messages
+
+            messages = messages + [message]
+            for call in calls:
+                name = (call.get("function") or {}).get("name", "")
+                run = tools.get(name)
+                # Arguments are read for the log and then ignored. Every tool
+                # here takes none, so there is nothing the model could pass that
+                # would change who the lookup is about.
+                log.info("tool call %s (round %s)", name or "<unnamed>", round_number)
+                result = run() if run else f"There is no tool called {name!r}."
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id", ""),
+                        "content": str(result),
+                    }
+                )
+
+        log.warning("tool loop hit its %s round limit", self.MAX_TOOL_ROUNDS)
+        return messages
 
     @staticmethod
     def _parse(payload: str) -> Proposal | None:
@@ -1284,6 +1465,15 @@ class Brain:
     MAX_ATTEMPTS = 5
 
     def _chat(self, messages: list[dict], **extra) -> str:
+        return self._chat_message(messages, **extra).get("content") or ""
+
+    def _chat_message(self, messages: list[dict], **extra) -> dict:
+        """The whole assistant message, not just its text.
+
+        The tool loop needs `tool_calls`, which is a sibling of `content` rather
+        than part of it, and is the only thing returned when the model decides
+        to call something instead of answering.
+        """
         payload = {
             "model": self._model,
             "messages": messages,
@@ -1293,7 +1483,7 @@ class Brain:
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             response = self._client.post("/chat/completions", json=payload)
             if response.is_success:
-                return response.json()["choices"][0]["message"]["content"]
+                return response.json()["choices"][0]["message"]
 
             if response.status_code not in self.RETRY_ON or attempt == self.MAX_ATTEMPTS:
                 raise RuntimeError(

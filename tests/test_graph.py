@@ -96,7 +96,7 @@ def state(*, refund=False, charge_on_file=None, reply="here you go") -> State:
         knowledge="guidance",
         inbox=FakeInbox(),
         payments=FakePayments(charge_on_file),
-        understand=lambda turns, knowledge, articles=(): proposal(
+        understand=lambda turns, knowledge, articles=(), tools=None: proposal(
             refund=refund, reply=reply
         ),
         now=NOW,
@@ -162,7 +162,7 @@ def test_the_policy_chooses_whether_money_moves_not_the_model():
 def test_a_confident_model_cannot_force_a_refund():
     """Even at a perfect rubric score, an ineligible charge routes to hold."""
     current = state(refund=True, charge_on_file=charge(refunded=True))
-    current.understand = lambda turns, knowledge, articles=(): proposal(
+    current.understand = lambda turns, knowledge, articles=(), tools=None: proposal(
         refund=True, clear=True, named=True, hedging=False
     )
     understand_node(current)

@@ -80,7 +80,7 @@ def run_passes(knowledge_file, passes: int, inbox) -> None:
             sleep=sleep,
             inbox=inbox,
             payments=None,
-            understand=lambda turns, knowledge, articles=(): Proposal(
+            understand=lambda turns, knowledge, articles=(), tools=None: Proposal(
                 reply=knowledge.strip(),
                 refund_requested=False,
                 clear_request=True,
@@ -114,7 +114,7 @@ def test_editing_the_knowledge_file_takes_effect_without_a_restart(tmp_path):
             sleep=sleep,
             inbox=inbox,
             payments=None,
-            understand=lambda turns, knowledge_text, articles=(): Proposal(
+            understand=lambda turns, knowledge_text, articles=(), tools=None: Proposal(
                 reply=knowledge_text.strip(),
                 refund_requested=False,
                 clear_request=True,
