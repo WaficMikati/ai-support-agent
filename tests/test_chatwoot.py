@@ -1,0 +1,132 @@
+"""Tests for the Chatwoot adapter.
+
+These run against canned Chatwoot JSON rather than a live instance, because
+the two bugs they guard against live in the mapping between Chatwoot's
+payload and our own types, not in the policy.
+"""
+
+import httpx
+import pytest
+
+from agent import ChatwootInbox, needs_reply
+
+ACCOUNT = "1"
+TOKEN = "test-token"
+
+INCOMING = {"id": 1, "content": "I want a refund", "message_type": 0, "private": False}
+OUTGOING = {"id": 2, "content": "on it", "message_type": 1, "private": False}
+PRIVATE_NOTE = {"id": 3, "content": "held for review", "message_type": 1, "private": True}
+ACTIVITY = {"id": 4, "content": "Label added", "message_type": 2, "private": False}
+
+CONVERSATION_ENTRY = {
+    "id": 7,
+    "meta": {"sender": {"email": "customer@example.com"}},
+}
+
+
+def inbox_for(messages) -> tuple[ChatwootInbox, list[httpx.Request]]:
+    """A ChatwootInbox wired to canned responses. Also returns the requests
+    made, so we can assert on what was sent."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/messages") and request.method == "GET":
+            return httpx.Response(200, json={"payload": list(messages)})
+        if request.url.path.endswith("/messages") and request.method == "POST":
+            return httpx.Response(200, json={"id": 99})
+        if request.url.path.endswith("/conversations"):
+            return httpx.Response(
+                200, json={"data": {"payload": [CONVERSATION_ENTRY]}}
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = ChatwootInbox(
+        "http://chatwoot.test",
+        ACCOUNT,
+        TOKEN,
+        transport=httpx.MockTransport(handler),
+    )
+    return client, seen
+
+
+def only_conversation(messages):
+    client, _ = inbox_for(messages)
+    conversations = client.open_conversations()
+    assert len(conversations) == 1
+    return conversations[0]
+
+
+# ------------------------------------------------------------------ mapping
+
+
+def test_contact_email_is_read_from_the_sender():
+    assert only_conversation([INCOMING]).contact_email == "customer@example.com"
+
+
+def test_incoming_and_outgoing_are_distinguished():
+    messages = only_conversation([INCOMING, OUTGOING]).messages
+    assert [m.incoming for m in messages] == [True, False]
+
+
+def test_private_notes_are_kept_and_flagged():
+    messages = only_conversation([INCOMING, PRIVATE_NOTE]).messages
+    assert len(messages) == 2, "private notes must survive the mapping"
+    assert messages[-1].private
+
+
+def test_activity_entries_are_marked_as_activity():
+    messages = only_conversation([INCOMING, ACTIVITY]).messages
+    assert messages[-1].activity
+
+
+# -------------------------------------------------------------- idempotency
+# Both of these failed before the mapping was fixed.
+
+
+def test_a_held_refund_is_not_picked_up_again():
+    """A private note is our turn. Without this the agent re-flags the same
+    conversation on every poll, once every few seconds, forever."""
+    conversation = only_conversation([INCOMING, PRIVATE_NOTE])
+    assert not needs_reply(conversation)
+
+
+def test_an_activity_entry_does_not_mute_the_conversation():
+    """A label or assignment landing after the customer writes in must not
+    look like a reply."""
+    conversation = only_conversation([INCOMING, ACTIVITY])
+    assert needs_reply(conversation)
+
+
+def test_customer_writing_again_after_a_note_reopens_it():
+    followup = {**INCOMING, "id": 5, "content": "any update?"}
+    conversation = only_conversation([INCOMING, PRIVATE_NOTE, followup])
+    assert needs_reply(conversation)
+
+
+# ------------------------------------------------------------------ writing
+
+
+@pytest.mark.parametrize(
+    ("method", "expect_private"),
+    [("send_reply", False), ("add_private_note", True)],
+)
+def test_posting_sets_the_private_flag_correctly(method, expect_private):
+    client, seen = inbox_for([INCOMING])
+    getattr(client, method)(7, "hello")
+    posts = [r for r in seen if r.method == "POST"]
+    assert len(posts) == 1
+    import json
+
+    body = json.loads(posts[0].content)
+    assert body == {
+        "content": "hello",
+        "message_type": "outgoing",
+        "private": expect_private,
+    }
+
+
+def test_requests_carry_the_access_token():
+    client, seen = inbox_for([INCOMING])
+    client.open_conversations()
+    assert all(r.headers["api_access_token"] == TOKEN for r in seen)

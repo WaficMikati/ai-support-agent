@@ -11,3 +11,10 @@ dev = ["pytest>=8.0"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.pyright]
+# Without this the editor cannot see the uv-managed virtualenv and reports
+# every third-party import as unresolved.
+venvPath = "."
+venv = ".venv"
+extraPaths = ["."]

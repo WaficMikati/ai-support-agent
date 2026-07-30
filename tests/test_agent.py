@@ -33,6 +33,7 @@ class FakeInbox:
         self.conversations = list(conversations)
         self.replies: list[tuple[int, str]] = []
         self.notes: list[tuple[int, str]] = []
+        self.resolved: list[int] = []
 
     def open_conversations(self):
         return self.conversations
@@ -42,6 +43,9 @@ class FakeInbox:
 
     def add_private_note(self, conversation_id, content):
         self.notes.append((conversation_id, content))
+
+    def resolve(self, conversation_id):
+        self.resolved.append(conversation_id)
 
 
 class FakePayments:
@@ -142,7 +146,18 @@ def test_previous_refunds_flag_the_customer():
 def test_already_refunded_charge_is_flagged():
     decision = refund_decision(charge(refunded=True), 0.95, now=NOW)
     assert not decision.auto_approve
-    assert "already refunded" in decision.reason
+    assert "already been refunded" in decision.reason
+
+
+def test_several_refundable_charges_are_flagged_rather_than_guessed():
+    ambiguous = charge(sibling_unrefunded_count=2)
+    decision = refund_decision(ambiguous, 0.95, now=NOW)
+    assert not decision.auto_approve
+    assert "3 unrefunded charges" in decision.reason
+
+
+def test_a_single_refundable_charge_is_not_ambiguous():
+    assert refund_decision(charge(sibling_unrefunded_count=0), 0.95, now=NOW).auto_approve
 
 
 def test_low_confidence_is_flagged():
@@ -249,6 +264,30 @@ def test_uncertain_refund_never_moves_money():
     assert action == "flagged"
     assert payments.refunded == []
     assert "confidence" in inbox.notes[0][1]
+
+
+def test_answered_conversation_is_resolved():
+    action, inbox, _ = run(conversation("how do I cancel"))
+    assert action == "answered"
+    assert inbox.resolved == [1]
+
+
+def test_refunded_conversation_is_resolved():
+    payments = FakePayments(charge())
+    action, inbox, _ = run(
+        conversation("refund please"), payments=payments, intent="refund"
+    )
+    assert action == "refunded"
+    assert inbox.resolved == [1]
+
+
+def test_held_refund_stays_open_for_a_human():
+    payments = FakePayments(charge(amount_cents=90_000))
+    action, inbox, _ = run(
+        conversation("refund please"), payments=payments, intent="refund"
+    )
+    assert action == "flagged"
+    assert inbox.resolved == [], "a human still has to act on it"
 
 
 def test_held_refund_note_carries_a_suggested_reply():

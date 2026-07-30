@@ -1,6 +1,7 @@
 .env
+admin.local.txt
 .venv/
 __pycache__/
 *.pyc
 .pytest_cache/
-uv.lock
+reload_check.log

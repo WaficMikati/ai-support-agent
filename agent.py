@@ -27,6 +27,33 @@ import httpx
 
 log = logging.getLogger("support-agent")
 
+
+# --------------------------------------------------------------------------
+# Configuration. Reading .env here keeps the whole system in one file with no
+# extra dependency. Real environment variables always win over the file.
+# --------------------------------------------------------------------------
+
+
+def load_env_file(path: str | Path = ".env") -> None:
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def require_env(name: str, hint: str = "") -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        message = f"{name} is not set. Add it to .env or export it."
+        raise SystemExit(f"{message} {hint}".strip())
+    return value
+
+
 # --------------------------------------------------------------------------
 # Refund policy. These are the numbers that decide the 90/10 split, and they
 # live here in the open rather than inside a prompt.
@@ -47,6 +74,8 @@ class Message:
     id: int
     content: str
     incoming: bool
+    private: bool = False
+    activity: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,7 +86,15 @@ class Conversation:
 
     @property
     def latest(self) -> Message | None:
-        return self.messages[-1] if self.messages else None
+        """The newest message that represents somebody speaking.
+
+        Chatwoot also files status changes, assignments and labels as
+        messages. Those are nobody's turn, so they are skipped: otherwise a
+        label being added after a customer writes in would look like a reply
+        and the conversation would never be answered.
+        """
+        spoken = [message for message in self.messages if not message.activity]
+        return spoken[-1] if spoken else None
 
 
 @dataclass(frozen=True)
@@ -65,8 +102,12 @@ class Charge:
     id: str
     amount_cents: int
     created: datetime
-    refunded: bool
+    refunded: bool  # any refund at all, full or partial
     prior_refund_count: int
+    # Other charges on the same customer that could equally be the one they
+    # mean. Customers rarely say which payment they are talking about, so more
+    # than one candidate is treated as a question for a human, not a guess.
+    sibling_unrefunded_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -90,6 +131,7 @@ class Inbox(Protocol):
     def open_conversations(self) -> list[Conversation]: ...
     def send_reply(self, conversation_id: int, content: str) -> None: ...
     def add_private_note(self, conversation_id: int, content: str) -> None: ...
+    def resolve(self, conversation_id: int) -> None: ...
 
 
 class Payments(Protocol):
@@ -132,7 +174,15 @@ def refund_decision(
         )
 
     if charge.refunded:
-        return Decision(False, f"charge {charge.id} is already refunded")
+        return Decision(False, f"charge {charge.id} has already been refunded")
+
+    if charge.sibling_unrefunded_count > 0:
+        total = charge.sibling_unrefunded_count + 1
+        return Decision(
+            False,
+            f"customer has {total} unrefunded charges, cannot tell which one "
+            "they mean",
+        )
 
     if charge.amount_cents > MAX_AUTO_REFUND_CENTS:
         return Decision(
@@ -210,6 +260,10 @@ def handle_conversation(
 
     reply = answer(latest.content, knowledge)
     inbox.send_reply(conversation.id, reply)
+    # Resolved rather than left open: Chatwoot reopens a conversation as soon
+    # as the customer writes again, so nothing is lost and the inbox does not
+    # fill up with conversations we have already dealt with.
+    inbox.resolve(conversation.id)
     return "answered"
 
 
@@ -229,6 +283,7 @@ def _handle_refund(
     decision = refund_decision(charge, result.confidence, now=now)
 
     if not decision.auto_approve:
+        # Deliberately left open: a person still has to act on it.
         inbox.add_private_note(
             conversation.id,
             "Refund request held for review.\n"
@@ -246,6 +301,7 @@ def _handle_refund(
         f"That's refunded, {charge.amount_cents / 100:.2f} is on its way back to "
         "your original payment method. It usually lands within a few days.",
     )
+    inbox.resolve(conversation.id)
     return "refunded"
 
 
@@ -279,13 +335,25 @@ def run_once(
     return actions
 
 
-def run_forever(interval_seconds: int = 5, **kwargs) -> None:
+def run_forever(
+    *,
+    knowledge_path: Path,
+    interval_seconds: int = 5,
+    sleep=time.sleep,
+    **kwargs,
+) -> None:
+    """Poll until interrupted.
+
+    The knowledge file is read on every pass rather than once at startup, so
+    editing it changes the agent's answers within one interval. That is the
+    whole point of keeping the guidance in a text file.
+    """
     while True:
         try:
-            run_once(**kwargs)
+            run_once(knowledge=knowledge_path.read_text(), **kwargs)
         except Exception:  # a bad poll should not kill the agent
             log.exception("poll failed")
-        time.sleep(interval_seconds)
+        sleep(interval_seconds)
 
 
 # --------------------------------------------------------------------------
@@ -294,11 +362,18 @@ def run_forever(interval_seconds: int = 5, **kwargs) -> None:
 
 
 class ChatwootInbox:
-    def __init__(self, base_url: str, account_id: str, token: str):
+    def __init__(
+        self,
+        base_url: str,
+        account_id: str,
+        token: str,
+        transport: httpx.BaseTransport | None = None,
+    ):
         self._client = httpx.Client(
             base_url=f"{base_url.rstrip('/')}/api/v1/accounts/{account_id}",
             headers={"api_access_token": token},
             timeout=20,
+            transport=transport,
         )
 
     def open_conversations(self) -> list[Conversation]:
@@ -310,14 +385,19 @@ class ChatwootInbox:
     def _conversation(self, conversation_id: int, entry: dict) -> Conversation:
         response = self._client.get(f"/conversations/{conversation_id}/messages")
         response.raise_for_status()
+        # message_type: 0 incoming, 1 outgoing, 2 activity, 3 template.
+        # Private notes are kept. They are how we mark that a refund has
+        # already been handed to a human, so dropping them here would make
+        # the agent flag the same conversation on every single poll.
         messages = tuple(
             Message(
                 id=item["id"],
                 content=item.get("content") or "",
-                incoming=item.get("message_type") == 0,  # 0 incoming, 1 outgoing
+                incoming=item.get("message_type") == 0,
+                private=bool(item.get("private")),
+                activity=item.get("message_type") == 2,
             )
             for item in response.json()["payload"]
-            if not item.get("private")
         )
         contact = (entry.get("meta") or {}).get("sender") or {}
         return Conversation(
@@ -331,6 +411,13 @@ class ChatwootInbox:
 
     def add_private_note(self, conversation_id: int, content: str) -> None:
         self._post(conversation_id, content, private=True)
+
+    def resolve(self, conversation_id: int) -> None:
+        response = self._client.post(
+            f"/conversations/{conversation_id}/toggle_status",
+            json={"status": "resolved"},
+        )
+        response.raise_for_status()
 
     def _post(self, conversation_id: int, content: str, *, private: bool) -> None:
         response = self._client.post(
@@ -353,12 +440,21 @@ class StripePayments:
     """Stripe, over plain HTTP. The key should be a restricted key that can
     only read charges and write refunds."""
 
-    def __init__(self, secret_key: str):
+    def __init__(self, secret_key: str, transport: httpx.BaseTransport | None = None):
         self._client = httpx.Client(
             base_url="https://api.stripe.com/v1",
             headers={"Authorization": f"Bearer {secret_key}"},
             timeout=20,
+            transport=transport,
         )
+
+    @staticmethod
+    def _has_any_refund(entry: dict) -> bool:
+        """Stripe sets `refunded` only when a charge is refunded in full, so a
+        partially refunded charge looks untouched. Both count as refunded here,
+        otherwise the policy would hand back the remaining balance of a charge
+        somebody has already been partly refunded for."""
+        return bool(entry.get("refunded")) or entry.get("amount_refunded", 0) > 0
 
     def latest_charge(self, email: str) -> Charge | None:
         customers = self._client.get("/customers", params={"email": email, "limit": 1})
@@ -375,13 +471,27 @@ class StripePayments:
         if not entries:
             return None
 
-        newest = entries[0]
+        prior_refund_count = sum(1 for item in entries if self._has_any_refund(item))
+        untouched = [item for item in entries if not self._has_any_refund(item)]
+
+        if untouched:
+            # Newest charge that could still be refunded, plus how many other
+            # candidates there are, so the policy can refuse to guess.
+            target = untouched[0]
+            siblings = len(untouched) - 1
+        else:
+            # Everything is already refunded. Return the newest anyway so the
+            # policy can say so rather than reporting no charge at all.
+            target = entries[0]
+            siblings = 0
+
         return Charge(
-            id=newest["id"],
-            amount_cents=newest["amount"],
-            created=datetime.fromtimestamp(newest["created"], tz=timezone.utc),
-            refunded=newest["refunded"],
-            prior_refund_count=sum(1 for item in entries[1:] if item["refunded"]),
+            id=target["id"],
+            amount_cents=target["amount"],
+            created=datetime.fromtimestamp(target["created"], tz=timezone.utc),
+            refunded=self._has_any_refund(target),
+            prior_refund_count=prior_refund_count - (0 if untouched else 1),
+            sibling_unrefunded_count=siblings,
         )
 
     def refund(self, charge_id: str) -> str:
@@ -418,12 +528,20 @@ confidence is how sure you are, from 0 to 1."""
 
 
 class GroqBrain:
-    def __init__(self, api_key: str, model: str = "openai/gpt-oss-20b"):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "openai/gpt-oss-20b",
+        transport: httpx.BaseTransport | None = None,
+        sleep=time.sleep,
+    ):
         self._model = model
+        self._sleep = sleep
         self._client = httpx.Client(
             base_url="https://api.groq.com/openai/v1",
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=30,
+            transport=transport,
         )
 
     def classify(self, message: str) -> Classification:
@@ -455,13 +573,29 @@ class GroqBrain:
             ]
         )
 
+    # Groq has been observed returning a one-off 400 for a request that then
+    # succeeds unchanged, so 400 is retried rather than treated as permanent.
+    # A genuinely malformed request just fails three times quickly and reports
+    # the response body, which raise_for_status() would have hidden.
+    RETRY_ON = {400, 408, 409, 425, 429, 500, 502, 503, 504}
+    MAX_ATTEMPTS = 3
+
     def _chat(self, messages: list[dict], **extra) -> str:
-        response = self._client.post(
-            "/chat/completions",
-            json={"model": self._model, "messages": messages, **extra},
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        payload = {"model": self._model, "messages": messages, **extra}
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            response = self._client.post("/chat/completions", json=payload)
+            if response.is_success:
+                return response.json()["choices"][0]["message"]["content"]
+
+            if response.status_code not in self.RETRY_ON or attempt == self.MAX_ATTEMPTS:
+                raise RuntimeError(
+                    f"Groq returned {response.status_code} after {attempt} "
+                    f"attempt(s): {response.text[:300]}"
+                )
+            delay = 2 ** (attempt - 1)
+            log.warning("groq returned %s, retrying in %ss", response.status_code, delay)
+            self._sleep(delay)
+        raise AssertionError("unreachable")
 
 
 # --------------------------------------------------------------------------
@@ -471,26 +605,44 @@ class GroqBrain:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    load_env_file()
 
-    knowledge = Path(
-        os.environ.get("KNOWLEDGE_FILE", "knowledge.md")
-    ).read_text()
+    knowledge_path = Path(os.environ.get("KNOWLEDGE_FILE", "knowledge.md"))
+    if not knowledge_path.exists():
+        raise SystemExit(f"knowledge file not found: {knowledge_path}")
 
-    inbox = ChatwootInbox(
-        base_url=os.environ["CHATWOOT_URL"],
-        account_id=os.environ["CHATWOOT_ACCOUNT_ID"],
-        token=os.environ["CHATWOOT_TOKEN"],
+    stripe_key = require_env(
+        "STRIPE_API_KEY", "A restricted key from a Stripe sandbox (rk_test_...)."
     )
-    payments = StripePayments(os.environ["STRIPE_API_KEY"])
-    brain = GroqBrain(os.environ["GROQ_API_KEY"])
+    # This is a demo and stays in a test environment, so refuse anything that
+    # could move real money rather than trusting the operator to notice.
+    if not stripe_key.startswith(("rk_test_", "sk_test_")):
+        raise SystemExit(
+            f"STRIPE_API_KEY is not a test key (starts {stripe_key[:8]!r}). "
+            "This agent only runs against Stripe test mode."
+        )
 
-    log.info("polling %s", os.environ["CHATWOOT_URL"])
+    chatwoot_url = require_env("CHATWOOT_URL", "e.g. http://localhost:3000")
+    inbox = ChatwootInbox(
+        base_url=chatwoot_url,
+        account_id=require_env("CHATWOOT_ACCOUNT_ID", "e.g. 1"),
+        token=require_env("CHATWOOT_TOKEN", "Chatwoot Profile Settings -> Access Token."),
+    )
+    payments = StripePayments(stripe_key)
+    brain = GroqBrain(
+        require_env("GROQ_API_KEY", "Free from console.groq.com, no card needed."),
+        model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"),
+    )
+
+    interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
+    log.info("polling %s every %ss, knowledge from %s", chatwoot_url, interval, knowledge_path)
     run_forever(
+        knowledge_path=knowledge_path,
+        interval_seconds=interval,
         inbox=inbox,
         payments=payments,
         classify=brain.classify,
         answer=brain.answer,
-        knowledge=knowledge,
     )
 
 

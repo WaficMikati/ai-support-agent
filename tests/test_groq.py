@@ -1,0 +1,127 @@
+"""Tests for the Groq adapter: request shape, parsing and retries.
+
+Groq has been seen returning a one-off 400 for a request that then succeeds
+unchanged, so the retry behaviour is pinned down here rather than discovered
+during a demo.
+"""
+
+import json
+
+import httpx
+import pytest
+
+from agent import GroqBrain
+
+
+def completion(content: str) -> dict:
+    return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+def brain_for(responses):
+    """A GroqBrain that returns the given responses in order. Sleeping is
+    replaced so retry tests do not actually wait."""
+    remaining = list(responses)
+    seen: list[httpx.Request] = []
+    slept: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        status, body = remaining.pop(0)
+        return httpx.Response(status, json=body)
+
+    client = GroqBrain(
+        "gsk_test",
+        transport=httpx.MockTransport(handler),
+        sleep=slept.append,
+    )
+    return client, seen, slept
+
+
+# ------------------------------------------------------------ request shape
+
+
+def test_classification_asks_for_a_strict_schema():
+    brain, seen, _ = brain_for([(200, completion('{"intent":"refund","confidence":0.9}'))])
+    brain.classify("I want my money back")
+    body = json.loads(seen[0].content)
+    assert body["model"] == "openai/gpt-oss-20b"
+    fmt = body["response_format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["json_schema"]["strict"] is True, "strict mode is why this model was picked"
+    schema = fmt["json_schema"]["schema"]
+    assert schema["properties"]["intent"]["enum"] == ["refund", "support"]
+    assert schema["additionalProperties"] is False
+
+
+def test_the_customer_message_is_the_user_turn():
+    brain, seen, _ = brain_for([(200, completion('{"intent":"support","confidence":0.7}'))])
+    brain.classify("I cannot log in")
+    body = json.loads(seen[0].content)
+    assert body["messages"][-1] == {"role": "user", "content": "I cannot log in"}
+
+
+def test_answering_passes_the_knowledge_and_asks_for_no_schema():
+    brain, seen, _ = brain_for([(200, completion("Try the reset link."))])
+    assert brain.answer("help", "## Cannot log in\nUse the reset link.") == "Try the reset link."
+    body = json.loads(seen[0].content)
+    assert "response_format" not in body, "free text, not JSON"
+    assert "Use the reset link." in body["messages"][0]["content"]
+
+
+def test_a_custom_model_is_honoured():
+    brain, seen, _ = brain_for([(200, completion("hi"))])
+    brain._model = "openai/gpt-oss-120b"
+    brain.answer("q", "kb")
+    assert json.loads(seen[0].content)["model"] == "openai/gpt-oss-120b"
+
+
+# ---------------------------------------------------------------- parsing
+
+
+def test_classification_is_parsed():
+    brain, _, _ = brain_for([(200, completion('{"intent":"refund","confidence":0.83}'))])
+    result = brain.classify("money back please")
+    assert result.intent == "refund"
+    assert result.confidence == pytest.approx(0.83)
+
+
+def test_integer_confidence_is_coerced_to_float():
+    brain, _, _ = brain_for([(200, completion('{"intent":"support","confidence":1}'))])
+    assert brain.classify("hello").confidence == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------- retries
+
+
+@pytest.mark.parametrize("status", [400, 429, 500, 503])
+def test_transient_failures_are_retried(status):
+    brain, seen, slept = brain_for(
+        [(status, {"error": "transient"}), (200, completion('{"intent":"support","confidence":0.9}'))]
+    )
+    assert brain.classify("hello").intent == "support"
+    assert len(seen) == 2, "should have retried once"
+    assert slept == [1], "one second before the second attempt"
+
+
+def test_retries_back_off_then_give_up_reporting_the_body():
+    brain, seen, slept = brain_for([(503, {"error": "still down"})] * 3)
+    with pytest.raises(RuntimeError) as failure:
+        brain.classify("hello")
+    assert len(seen) == 3, "three attempts, then stop"
+    assert slept == [1, 2], "exponential backoff between attempts"
+    assert "503" in str(failure.value)
+    assert "still down" in str(failure.value), "the body must not be swallowed"
+
+
+def test_a_permanent_failure_is_not_retried():
+    brain, seen, _ = brain_for([(401, {"error": "bad key"})])
+    with pytest.raises(RuntimeError) as failure:
+        brain.classify("hello")
+    assert len(seen) == 1, "401 will not fix itself"
+    assert "bad key" in str(failure.value)
+
+
+def test_requests_are_authorised():
+    brain, seen, _ = brain_for([(200, completion("hi"))])
+    brain.answer("q", "kb")
+    assert seen[0].headers["Authorization"] == "Bearer gsk_test"
