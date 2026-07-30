@@ -41,6 +41,11 @@ class FakeInbox:
     def send_reply(self, conversation_id, content):
         self.replies.append((conversation_id, content))
 
+    def send_choice(self, conversation_id, content, options):
+        self.replies.append((conversation_id, content))
+        self.offered = list(options)
+
+
     def add_private_note(self, conversation_id, content):
         self.notes.append((conversation_id, content))
 
@@ -57,6 +62,9 @@ class FakePayments:
 
     def latest_charge(self, email):
         return self.charge
+
+    def charges_for(self, email):
+        return [self.charge] if self.charge else []
 
     def refund(self, charge_id, idempotency_key):
         self.refunded.append((charge_id, idempotency_key))

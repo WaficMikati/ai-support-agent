@@ -5,42 +5,122 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Acme Coffee — Support demo</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1.5rem;
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 0 auto 4rem; padding: 0 1.5rem;
            color: #1c1c1c; line-height: 1.6; }
     h1 { font-size: 1.6rem; margin-bottom: .25rem; }
     p.lede { color: #555; margin-top: 0; }
-    .hint { margin-top: 3rem; padding: 1rem 1.25rem; background: #f4f4f5; border-radius: .5rem;
+    .hint { margin-top: 2rem; padding: 1rem 1.25rem; background: #f4f4f5; border-radius: .5rem;
             font-size: .95rem; color: #444; }
-    button.reset { margin-top: 1.5rem; padding: .5rem .9rem; font: inherit; font-size: .9rem;
-                   border: 1px solid #d4d4d8; background: #fff; border-radius: .4rem;
-                   cursor: pointer; color: #444; }
-    button.reset:hover { background: #f4f4f5; }
-    #reset-note { font-size: .85rem; color: #777; margin-top: .6rem; min-height: 1.2em; }
-    fieldset.scenario { margin-top: 2rem; border: 1px solid #e4e4e7; border-radius: .5rem;
-                        padding: 1rem 1.25rem 1.25rem; }
-    fieldset.scenario legend { font-size: .85rem; color: #777; padding: 0 .4rem; }
-    fieldset.scenario label { display: block; font-size: .85rem; color: #555;
-                              margin-bottom: .2rem; }
-    fieldset.scenario .field { margin-top: .6rem; }
-    fieldset.scenario .field[hidden] { display: none; }
-    fieldset.scenario select { width: 100%; padding: .4rem; font: inherit; font-size: .9rem;
-                               border: 1px solid #d4d4d8; border-radius: .4rem; background: #fff; }
-    .scenario-note { font-size: .8rem; color: #777; margin: .9rem 0 0; }
-    .scenario-note code { background: #f4f4f5; padding: .05rem .3rem; border-radius: .25rem; }
+
+    /* Who you are, kept in front of you. Forgetting the address you registered
+       with is the one thing that makes the anonymous chat look broken: the
+       agent asks for it and then refuses the one you guessed at. */
+    header.bar { display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+                 padding: .75rem 0; margin-bottom: 2rem; border-bottom: 1px solid #e4e4e7; }
+    header.bar .brand { font-weight: 600; }
+    details.who[hidden] { display: none; }
+    details.who { position: relative; }
+    details.who summary { list-style: none; cursor: pointer; font-size: .85rem; color: #444;
+                          border: 1px solid #d4d4d8; border-radius: 2rem; padding: .3rem .8rem;
+                          background: #fff; white-space: nowrap; }
+    details.who summary::-webkit-details-marker { display: none; }
+    details.who summary::after { content: " \25be"; color: #999; }
+    details.who .menu { position: absolute; right: 0; top: 2.4rem; z-index: 10; min-width: 15rem;
+                        background: #fff; border: 1px solid #e4e4e7; border-radius: .5rem;
+                        box-shadow: 0 6px 24px rgba(0,0,0,.08); padding: .35rem; }
+    details.who .menu button { display: block; width: 100%; text-align: left; font: inherit;
+                               font-size: .875rem; background: none; border: 0; cursor: pointer;
+                               padding: .5rem .6rem; border-radius: .35rem; color: #333; }
+    details.who .menu button:hover { background: #f4f4f5; }
+    details.who .menu .sep { height: 1px; background: #eee; margin: .3rem .2rem; }
+
+    button.primary { margin-top: 1.25rem; padding: .5rem .9rem; font: inherit; font-size: .9rem;
+                     border: 1px solid #d4d4d8; background: #fff; border-radius: .4rem;
+                     cursor: pointer; color: #444; }
+    button.primary:hover { background: #f4f4f5; }
+    #note { font-size: .85rem; color: #777; margin-top: .6rem; min-height: 1.2em; }
+
+    fieldset.panel { margin-top: 1.75rem; border: 1px solid #e4e4e7; border-radius: .5rem;
+                     padding: 1rem 1.25rem 1.25rem; }
+    fieldset.panel[hidden] { display: none; }
+    fieldset.panel legend { font-size: .85rem; color: #777; padding: 0 .4rem; }
+    fieldset.panel label { display: block; font-size: .85rem; color: #555; margin-bottom: .2rem; }
+    fieldset.panel .field { margin-top: .6rem; }
+    fieldset.panel .field[hidden] { display: none; }
+    fieldset.panel select,
+    fieldset.panel input { width: 100%; padding: .4rem; font: inherit; font-size: .9rem;
+                           border: 1px solid #d4d4d8; border-radius: .4rem; background: #fff; }
+    .note { font-size: .8rem; color: #777; margin: .9rem 0 0; }
   </style>
 </head>
 <body>
-  <h1>Acme Coffee</h1>
-  <p class="lede">Freshly roasted coffee, delivered every month.</p>
+  <header class="bar">
+    <span class="brand">Acme Coffee</span>
+    <details class="who" id="who" hidden>
+      <summary id="who-label">signed in</summary>
+      <div class="menu">
+        <button type="button" id="change">Change your details…</button>
+        <div class="sep"></div>
+        <button type="button" id="signout">Sign out</button>
+      </div>
+    </details>
+  </header>
+
+  <h1>Freshly roasted coffee</h1>
+  <p class="lede">Delivered every month.</p>
   <p>Our support agent answers common questions straight away, from our help
   centre. Anything it is not sure about goes to a person.</p>
+
   <div class="hint">Open the chat bubble in the corner and ask something, for
   example <em>"can I skip a month?"</em>, <em>"do you have decaf?"</em> or
-  <em>"my delivery hasn't arrived"</em>. Or ask for a refund: the visitor is a
-  signed-in customer with a payment on file.</div>
+  <em>"my delivery hasn't arrived"</em>. Or ask for a refund.</div>
 
-  <fieldset class="scenario">
-    <legend>Set up the customer</legend>
+  <fieldset class="panel" id="login">
+    <legend>Your details</legend>
+    <p class="note" style="margin-top:0">Asked once. Everything after this is the
+    same person, so the address the agent knows you by does not move around.</p>
+
+    <div class="field">
+      <label for="first-name">First name</label>
+      <input id="first-name" type="text" autocomplete="given-name">
+    </div>
+
+    <div class="field">
+      <label for="last-name">Last name</label>
+      <input id="last-name" type="text" autocomplete="family-name">
+    </div>
+
+    <div class="field">
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="email" placeholder="you@example.com">
+    </div>
+
+    <button class="primary" id="continue">Continue</button>
+  </fieldset>
+
+  <fieldset class="panel" id="behaviour" hidden>
+    <legend>What the chat may know about you</legend>
+
+    <div class="field">
+      <label for="start">How the chat starts</label>
+      <select id="start">
+        <option value="anonymous">Anonymous — the agent has to ask who you are</option>
+        <option value="identified">Identified — the agent is told, and says so</option>
+      </select>
+    </div>
+
+    <div class="field" id="field-lookup">
+      <label for="lookup">Which address it will accept</label>
+      <select id="lookup">
+        <option value="gated">Only yours — anyone else's is refused</option>
+        <option value="open">Any address it is given — looked up as typed</option>
+      </select>
+    </div>
+  </fieldset>
+
+  <fieldset class="panel" id="scenario" hidden>
+    <legend>Your payment history</legend>
+
     <div class="field">
       <label for="history">Account history</label>
       <select id="history">
@@ -72,25 +152,24 @@
     <div class="field" id="field-amount2">
       <label for="amount2">Second payment amount</label>
       <select id="amount2">
-        <option value="9000">$90.00 — over the limit, needs a person</option>
-        <option value="2000">$20.00 — inside the auto-approval limit</option>
+        <option value="3500">$35.00 — inside the auto-approval limit</option>
+        <option value="12000">$120.00 — over the limit, needs a person</option>
       </select>
     </div>
 
     <div class="field" id="field-age2">
       <label for="age2">Second payment date</label>
       <select id="age2">
-        <option value="0">Today — inside the refund window</option>
-        <option value="45">45 days ago — outside the window</option>
+        <option value="7">A week ago — inside the refund window</option>
+        <option value="60">60 days ago — outside the window</option>
       </select>
     </div>
 
-    <p class="scenario-note" id="expected"></p>
+    <p class="note" id="expected"></p>
+    <button class="primary" id="apply">Rebuild it and start a fresh conversation</button>
   </fieldset>
 
-  <button class="reset" id="reset">Start a fresh conversation</button>
-  <p id="reset-note">A plain refresh resumes the same conversation, so use this
-  between demo runs.</p>
+  <p id="note"></p>
 
   <script>
     (function (d, t) {
@@ -104,59 +183,89 @@
       };
     })(document, "script");
 
-    var DEFAULT_VISITOR = {
-      identifier: "demo-visitor",
-      email: "demo@example.com",
-      name: "Demo Customer",
-    };
+    // Nobody is anybody until they say who they are, and then they stay that
+    // person. Earlier versions minted an address on every reset, so the agent
+    // knew one that had never been given to it, and it moved whenever the
+    // payment history was rebuilt. Both make the anonymous chat look broken: it
+    // asks for an address and then refuses the one you remember giving it.
 
-    // Who this browser is currently pretending to be. Kept in localStorage so
-    // it survives the reload a reset performs. Without this the reset rotated
-    // the identity, reloaded, and the ready handler below immediately put the
-    // original customer back, so the same conversation reappeared and the reset
-    // looked like it had done nothing.
     function currentVisitor() {
       try {
-        return JSON.parse(localStorage.getItem("demoVisitor")) || DEFAULT_VISITOR;
+        return JSON.parse(localStorage.getItem("demoVisitor")) || null;
       } catch (e) {
-        return DEFAULT_VISITOR;
+        return null;
       }
     }
 
     function rememberVisitor(visitor) {
       try {
         localStorage.setItem("demoVisitor", JSON.stringify(visitor));
-      } catch (e) { /* private mode; the reset still works for this session */ }
+      } catch (e) { /* private mode; it still works for this session */ }
     }
 
-    // Put the selectors back where they were left. The reset reloads the page,
-    // and controls snapping back to their defaults while the note underneath
-    // describes something else is a confusing thing to have on a screen in
-    // front of a room.
+    function forgetVisitor() {
+      try {
+        localStorage.removeItem("demoVisitor");
+      } catch (e) { /* nothing to undo */ }
+    }
+
+    function value(id) {
+      return (document.getElementById(id).value || "").trim();
+    }
+
+    function show(id, visible) {
+      document.getElementById(id).hidden = !visible;
+    }
+
+    // What the server needs to build somebody and their payment history. A
+    // hidden control sends its default rather than whatever it was last set to,
+    // or a choice made earlier and since put out of sight would quietly build
+    // something other than what the page is showing.
+    function payload() {
+      var known = currentVisitor() || {};
+      return {
+        register_email: value("email"),
+        first_name: value("first-name"),
+        last_name: value("last-name"),
+        email: known.email || "",
+        history: value("history"),
+        amount_cents: document.getElementById("field-amount").hidden
+          ? 2000
+          : parseInt(value("amount"), 10),
+        backdate_days: document.getElementById("field-age").hidden
+          ? 0
+          : parseInt(value("age"), 10),
+        amount_cents_2: document.getElementById("field-amount2").hidden
+          ? 0
+          : parseInt(value("amount2"), 10),
+        backdate_days_2: document.getElementById("field-age2").hidden
+          ? 0
+          : parseInt(value("age2"), 10),
+      };
+    }
+
+    // Remember every control, so a reload does not throw away what was typed.
+    var REMEMBERED = ["first-name", "last-name", "email", "start", "lookup",
+                      "history", "amount", "age", "amount2", "age2"];
     (function () {
-      ["history", "amount", "age", "amount2", "age2"].forEach(function (id) {
-        var select = document.getElementById(id);
+      REMEMBERED.forEach(function (id) {
+        var control = document.getElementById(id);
         var saved = sessionStorage.getItem("demoChoice-" + id);
-        if (saved) select.value = saved;
-        select.addEventListener("change", function () {
-          sessionStorage.setItem("demoChoice-" + id, select.value);
+        if (saved) control.value = saved;
+        control.addEventListener("change", function () {
+          sessionStorage.setItem("demoChoice-" + id, control.value);
           refreshFields();
+        });
+        control.addEventListener("input", function () {
+          sessionStorage.setItem("demoChoice-" + id, control.value);
         });
       });
     })();
 
-    // The amount and the date are hidden only when there is no payment to give
-    // them to. They stay for every other history, because they are not only
-    // refund inputs: the agent can look a payment up and talk about it, and
-    // "your payment of $90.00 on that date has already been refunded" is a real
-    // thing to demonstrate. Judging them by whether they change the refund
-    // outcome alone was too narrow.
-    //
-    // What they must not do is quietly contradict the label. refund_decision
-    // stops at the first check that fails, so a $90.00 payment with an earlier
-    // refund on the account trips the amount rule and never reaches the
-    // earlier-refund rule. Rather than forbid the combination, the line below
-    // works out which check really fires, in the same order the policy uses.
+    // refund_decision stops at the first check that fails, in this order: no
+    // charge, rubric, disputed, already refunded, more than one charge, amount,
+    // age, earlier refunds. Working it out the same way here is what stops the
+    // line below promising an outcome the agent will not produce.
     function firstFailure(history, amountCents, ageDays) {
       if (history === "none") return "nothing on the account";
       if (history === "disputed") return "disputed with the bank";
@@ -169,21 +278,26 @@
     }
 
     function refreshFields() {
-      var history = document.getElementById("history").value;
-      var amountCents = parseInt(document.getElementById("amount").value, 10);
-      var ageDays = parseInt(document.getElementById("age").value, 10);
+      var history = value("history");
+      var amountCents = parseInt(value("amount"), 10);
+      var ageDays = parseInt(value("age"), 10);
 
+      // The amount and the date are hidden only when there is no payment to
+      // give them to. They stay otherwise, because they are not only refund
+      // inputs: the agent can look a payment up and talk about it.
       var hasPayment = history !== "none";
-      // Two payments means two of everything. Giving them the same amount and
-      // the same date made "I cannot tell which one you mean" abstract: they
-      // were indistinguishable, so there was nothing for the customer to point
-      // at and nothing for the agent to be unable to choose between.
+      // Two payments means two of everything, with their own values, or the
+      // choice it offers has nothing to tell them apart by.
       var twoPayments = history === "multiple";
 
-      document.getElementById("field-amount").hidden = !hasPayment;
-      document.getElementById("field-age").hidden = !hasPayment;
-      document.getElementById("field-amount2").hidden = !twoPayments;
-      document.getElementById("field-age2").hidden = !twoPayments;
+      show("field-amount", hasPayment);
+      show("field-age", hasPayment);
+      show("field-amount2", twoPayments);
+      show("field-age2", twoPayments);
+
+      // Which addresses are accepted only means something while the agent is
+      // still waiting to be told one. An identified chat was told at the start.
+      show("field-lookup", value("start") === "anonymous");
 
       document.getElementById("label-amount").textContent =
         twoPayments ? "First payment amount" : "Payment amount";
@@ -199,122 +313,149 @@
         ".";
     }
 
-    refreshFields();
+    // Signed in or not, and only ever one of the two on screen, so nothing asks
+    // again for something already answered.
+    function render() {
+      var visitor = currentVisitor();
+      show("login", !visitor);
+      show("behaviour", !!visitor);
+      show("scenario", !!visitor);
+      show("who", !!visitor);
+      if (visitor) {
+        document.getElementById("who-label").textContent =
+          visitor.name + " · " + visitor.email;
+      }
+      refreshFields();
+    }
+
+    render();
 
     (function () {
-      var afterReset = sessionStorage.getItem("demoResetEmail");
-      if (afterReset) {
-        var cleared = sessionStorage.getItem("demoResetCleared") || "0";
-        var history = sessionStorage.getItem("demoResetHistory") || "clean";
-        var amount = sessionStorage.getItem("demoResetAmount") || "";
-        var days = parseInt(sessionStorage.getItem("demoResetAge") || "0", 10);
-        sessionStorage.removeItem("demoResetEmail");
-        sessionStorage.removeItem("demoResetCleared");
-        sessionStorage.removeItem("demoResetHistory");
-        sessionStorage.removeItem("demoResetAmount");
-        sessionStorage.removeItem("demoResetAge");
-        // Say what was actually set up, so what the agent does next can be
-        // checked against it rather than taken on trust.
-        var money = amount ? "$" + (parseInt(amount, 10) / 100).toFixed(2) : "a payment";
-        var when = days ? " from " + days + " days ago" : " from today";
-        var SETUP = {
-          clean: "one payment of " + money + when + ", nothing refunded",
-          refunded: "one payment of " + money + when + ", already refunded",
-          disputed: "one payment of " + money + when + ", disputed with the bank",
-          prior: "a payment of " + money + when + ", after an earlier one was refunded",
-          multiple: "two payments of " + money + when + ", neither refunded",
-          none: "no payments at all",
-        };
-        document.getElementById("reset-note").textContent =
-          "Fresh conversation as " + afterReset +
-          ", with " + (SETUP[history] || SETUP.clean) + ". " +
-          (cleared === "0"
-            ? "The queue was already empty."
-            : "Cleared " + cleared + " conversation(s) from the queue.") +
-          " Open the chat bubble.";
-      }
+      var done = sessionStorage.getItem("demoDone");
+      if (!done) return;
+      sessionStorage.removeItem("demoDone");
+      document.getElementById("note").textContent = done;
     })();
 
-    // Tell the widget who the visitor is, the way a real site would for a
-    // signed-in customer. Two reasons this matters rather than leaving them
-    // anonymous: Chatwoot stops interrupting the conversation to ask for an
-    // email, and the refund path has an address to match against Stripe. An
-    // anonymous visitor can never be matched to a charge.
-    window.addEventListener("chatwoot:ready", function () {
+    // Told once the widget is ready, and again immediately if it already was.
+    // The event fires on the SDK's own schedule and can be gone before this
+    // listener exists, which leaves the visitor anonymous with no error
+    // anywhere: the page looks fine, the contact simply never gets a name.
+    function announce() {
       var visitor = currentVisitor();
+      if (!visitor || !window.$chatwoot) return;
+
+      // The address rides in the attributes, not on the contact record.
+      // Chatwoot will not let a second contact take an email or an identifier
+      // another one holds, and will not change an identifier once set, so
+      // setUser is not something to depend on: it fails silently and often.
+      window.$chatwoot.setCustomAttributes({
+        demo_start: visitor.start,
+        demo_lookup: visitor.lookup,
+        demo_email: visitor.email,
+      });
+
+      // Still done, because a named contact is what makes the Chatwoot
+      // dashboard worth showing. Nothing depends on it working.
       window.$chatwoot.setUser(visitor.identifier, {
         email: visitor.email,
         name: visitor.name,
       });
-    });
+    }
 
-    // A fresh conversation means a fresh customer. $chatwoot.reset() does not
-    // clear the visitor, the cookie is out of reach because the chat is an
-    // iframe on its own origin, and deleting contacts server-side leaves this
-    // page holding a dead token. What works is asking the server for a new
-    // customer, complete with a refundable charge, and identifying as them.
-    document.getElementById("reset").addEventListener("click", function () {
-      var note = document.getElementById("reset-note");
-      var button = document.getElementById("reset");
-      button.disabled = true;
-      note.textContent = "Starting a fresh conversation…";
+    window.addEventListener("chatwoot:ready", announce);
+    announce();
 
-      fetch("/reset", {
+    function submit(route, describe) {
+      var note = document.getElementById("note");
+      var asked = payload();
+
+      if (!asked.first_name || !asked.last_name || !asked.register_email) {
+        note.textContent = "Your first name, last name and email are all needed.";
+        return;
+      }
+      note.textContent = "Setting you up…";
+
+      fetch(route, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          // A hidden control sends its default, not whatever it was last set
-          // to. Otherwise a $90.00 chosen earlier is still in the box while
-          // the box is out of sight, and the account gets built to something
-          // other than what the page is showing.
-          amount_cents: document.getElementById("field-amount").hidden
-            ? 2000
-            : parseInt(document.getElementById("amount").value, 10),
-          backdate_days: document.getElementById("field-age").hidden
-            ? 0
-            : parseInt(document.getElementById("age").value, 10),
-          amount_cents_2: document.getElementById("field-amount2").hidden
-            ? 0
-            : parseInt(document.getElementById("amount2").value, 10),
-          backdate_days_2: document.getElementById("field-age2").hidden
-            ? 0
-            : parseInt(document.getElementById("age2").value, 10),
-          history: document.getElementById("history").value,
-        }),
+        body: JSON.stringify(asked),
       })
         .then(function (response) { return response.json(); })
         .then(function (body) {
-          if (!body.ok) throw new Error(body.error || "reset failed");
-          // Remember before reloading, so the ready handler identifies as the
-          // new customer rather than putting the old one back.
+          if (!body.ok) throw new Error(body.error || "could not set you up");
+          // Remembered before reloading, so the ready handler above identifies
+          // as this person rather than putting the previous one back.
           rememberVisitor({
             identifier: body.identifier,
             email: body.email,
             name: body.name,
+            start: value("start"),
+            lookup: value("lookup"),
           });
-          // Deliberately NOT calling setUser here. Doing so attaches the new
-          // identity to the contact we are about to abandon, and Chatwoot allows
-          // one contact per identifier and per email, so after the reload the
-          // fresh contact cannot claim them: setUser fails silently and the
-          // visitor stays anonymous, which means refunds never match a charge.
-          //
-          // The server has already cleared the visitor cookie, so reloading
-          // makes the widget mint a brand new contact, and the ready handler
-          // above claims the identity for that one instead.
-          sessionStorage.setItem("demoResetEmail", body.email);
-          sessionStorage.setItem("demoResetCleared", String(body.cleared || 0));
-          sessionStorage.setItem("demoResetHistory", body.history || "clean");
-          sessionStorage.setItem("demoResetAge", body.backdate_days || "0");
-          sessionStorage.setItem("demoResetAmount", body.amount_cents || "");
-          note.textContent = "Fresh conversation ready, reloading…";
+          // Deliberately NOT calling setUser here. It would attach the identity
+          // to the contact we are about to abandon, and the fresh one after the
+          // reload could then never claim it.
+          sessionStorage.setItem("demoDone", describe(body));
           location.reload();
         })
         .catch(function (error) {
-          button.disabled = false;
           note.textContent =
-            "Reset failed: " + error.message +
+            "Could not set you up: " + error.message +
             ". Is the page served by demo/serve.py?";
         });
+    }
+
+    function historyLine(body) {
+      var money = body.amount_cents
+        ? "$" + (parseInt(body.amount_cents, 10) / 100).toFixed(2)
+        : "a payment";
+      var days = parseInt(body.backdate_days || "0", 10);
+      var when = days ? " from " + days + " days ago" : " from today";
+      var SETUP = {
+        clean: "one payment of " + money + when + ", nothing refunded",
+        refunded: "one payment of " + money + when + ", already refunded",
+        disputed: "one payment of " + money + when + ", disputed with the bank",
+        prior: "a payment of " + money + when + ", after an earlier one was refunded",
+        multiple: "two payments" + when + ", neither refunded",
+        none: "no payments at all",
+      };
+      return SETUP[body.history] || SETUP.clean;
+    }
+
+    document.getElementById("continue").addEventListener("click", function () {
+      submit("/register", function (body) {
+        return "Signed in as " + body.email + ", with " + historyLine(body) +
+               ". Open the chat bubble.";
+      });
+    });
+
+    document.getElementById("apply").addEventListener("click", function () {
+      submit("/reset", function (body) {
+        var startedAs = value("start") === "identified"
+          ? "The agent has been told who you are."
+          : "The agent has not been told who you are, so it will ask.";
+        return "Rebuilt: " + historyLine(body) + ". " + startedAs +
+               " Open the chat bubble.";
+      });
+    });
+
+    // Changing your details is signing out and back in, which is also what
+    // frees the address in Chatwoot for whoever claims it next.
+    document.getElementById("change").addEventListener("click", function () {
+      document.getElementById("who").open = false;
+      forgetVisitor();
+      render();
+      document.getElementById("note").textContent =
+        "Change what you need and press Continue.";
+    });
+
+    document.getElementById("signout").addEventListener("click", function () {
+      forgetVisitor();
+      REMEMBERED.forEach(function (id) {
+        sessionStorage.removeItem("demoChoice-" + id);
+      });
+      location.reload();
     });
   </script>
 </body>

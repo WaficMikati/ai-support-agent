@@ -46,6 +46,11 @@ class FakeInbox:
     def send_reply(self, conversation_id, content):
         self.replies.append((conversation_id, content))
 
+    def send_choice(self, conversation_id, content, options):
+        self.replies.append((conversation_id, content))
+        self.offered = list(options)
+
+
     def add_private_note(self, conversation_id, content):
         self.notes.append((conversation_id, content))
 
@@ -64,6 +69,9 @@ class FakePayments:
 
     def latest_charge(self, email):
         return self.charge
+
+    def charges_for(self, email):
+        return [self.charge] if self.charge else []
 
     def refund(self, charge_id, idempotency_key):
         self.refunded.append(charge_id)
@@ -349,9 +357,10 @@ def test_each_reason_for_holding_gets_its_own_explanation():
     """The model writes before the policy runs, so it cannot know a colleague is
     taking over. Where code knows the payment is the problem, it says so instead
     of leaving a question that is moot by the time it arrives."""
+    # "ambiguous" is deliberately absent: more than one payment is now a
+    # question put to the customer rather than a reason to fetch a colleague.
     cases = {
         "already_refunded": (charge(refunded=True), "already been refunded"),
-        "ambiguous": (charge(sibling_unrefunded_count=2), "more than one payment"),
         "too_large": (charge(amount_cents=90_000), "needs a colleague to approve"),
         "too_old": (
             charge(created=NOW - timedelta(days=MAX_CHARGE_AGE_DAYS + 1)),
@@ -464,13 +473,21 @@ def test_refund_with_no_matching_customer_is_held():
     assert "no charge found" in inbox.notes[0][1]
 
 
-def test_refund_from_an_anonymous_conversation_is_held():
+def test_a_refund_from_somebody_we_cannot_identify_is_answered_not_held():
+    """Asking who they are comes first.
+
+    This used to be held, which produced the worst of both: no charge could be
+    found, so the customer was told there were no payments on their account,
+    which was not true, and the request went to a colleague before anybody knew
+    whose it was. Money still cannot move either way, which is the part that
+    matters."""
     payments = FakePayments(charge())
     action, inbox, payments = run(
         conversation("refund", email=None), payments=payments, intent="refund"
     )
-    assert action == "flagged"
+    assert action == "answered"
     assert payments.refunded == []
+    assert inbox.notes == [], "nothing to escalate until we know who they are"
 
 
 def test_a_hedged_refund_never_moves_money():

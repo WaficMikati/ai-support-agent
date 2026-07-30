@@ -19,7 +19,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence
@@ -128,6 +128,11 @@ class Conversation:
     # happened to carry. Deciding whether to reply needs one message; writing
     # the reply needs all of them, and the two are fetched at different moments.
     history_complete: bool = False
+    # The contact's own custom attributes, which the conversation list already
+    # carries. The demo page writes this visitor's two choices there, so how a
+    # conversation behaves travels with the person rather than being a setting
+    # on the agent that everybody shares.
+    contact_attributes: Mapping[str, object] = field(default_factory=dict)
 
     def turns(self, limit: int = 10) -> tuple[Turn, ...]:
         """The conversation as the model should read it, oldest last-limit first.
@@ -275,6 +280,9 @@ class Inbox(Protocol):
     def open_conversations(self) -> list[Conversation]: ...
     def with_history(self, conversation: Conversation) -> Conversation: ...
     def send_reply(self, conversation_id: int, content: str) -> None: ...
+    def send_choice(
+        self, conversation_id: int, content: str, options: Sequence[str]
+    ) -> None: ...
     def add_private_note(self, conversation_id: int, content: str) -> None: ...
     def resolve(self, conversation_id: int) -> None: ...
     def record_handled(self, conversation_id: int, message_id: int) -> None: ...
@@ -282,6 +290,7 @@ class Inbox(Protocol):
 
 class Payments(Protocol):
     def latest_charge(self, email: str) -> Charge | None: ...
+    def charges_for(self, email: str) -> list[Charge]: ...
     def refund(self, charge_id: str, idempotency_key: str) -> str: ...
 
 
@@ -609,6 +618,7 @@ class State:
     now: datetime | None = None
 
     articles: tuple[Article, ...] = ()
+    charges: tuple[Charge, ...] = ()
     proposal: Proposal | None = None
     charge: Charge | None = None
     decision: Decision | None = None
@@ -627,38 +637,251 @@ class State:
 # --------------------------------------------------------------------------
 
 
-def describe_charge(charge: Charge | None) -> str:
-    """A payment as a sentence, for the model to read.
+# --------------------------------------------------------------------------
+# Who a conversation is allowed to be about
+# --------------------------------------------------------------------------
 
-    Deliberately no charge id: it is meaningless to the customer, and anything
-    put in front of the model can end up quoted back to them.
+# Written by the demo page onto the contact, so one shared instance can have
+# every visitor set up differently rather than a single switch for the room.
+START_ATTRIBUTE = "demo_start"
+LOOKUP_ATTRIBUTE = "demo_lookup"
+# The address they registered with, carried here rather than read off the
+# contact record. Chatwoot allows one contact per email and per identifier and
+# will not change an identifier once set, so a returning visitor, or anybody
+# reusing an address, ends up on a contact that cannot claim it. setUser then
+# fails without a word: the visitor stays nameless, the agent has nothing to
+# check a stated address against, and the symptom is being asked for an address
+# that is then refused. Three separate bugs came from that before this stopped
+# depending on it. Custom attributes have no uniqueness rules and have landed
+# every time.
+EMAIL_ATTRIBUTE = "demo_email"
+
+# How the conversation begins.
+IDENTIFIED = "identified"  # we already know them, and say so
+ANONYMOUS = "anonymous"  # a stranger until they tell us who they are
+
+# What counts as telling us.
+GATED = "gated"  # only the address this browser registered with
+OPEN = "open"  # whatever address is typed, which is the interesting one
+
+EMAIL_PATTERN = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]*\w")
+
+
+def stated_email(conversation: Conversation) -> str | None:
+    """The last address the customer typed, if they have typed one.
+
+    Read from what they said rather than supplied by the model, which keeps the
+    tools argument-free in both lookup models. The model can decide it wants to
+    look something up; it never gets to choose whose account that is.
     """
-    if charge is None:
-        # Phrased as a fact rather than as a failed search. "No payment was
-        # found" reads to the model like the lookup broke, and it then tells the
-        # customer it does not have the information, which is the opposite of
-        # what it just learned.
+    for turn in reversed(conversation.turns()):
+        if turn.role != "user":
+            continue
+        found = EMAIL_PATTERN.findall(turn.content)
+        if found:
+            return found[-1]
+    return None
+
+
+def identified_email(conversation: Conversation) -> str | None:
+    """Whose account this conversation may read, or None while nobody knows.
+
+    Identified conversations know from the start, the way a signed-in session
+    does. Anonymous ones begin as a stranger and stay that way until an address
+    is said out loud, which is the point: the agent cannot quietly know things
+    about somebody who has not introduced themselves.
+
+    Which addresses count is the second choice, and it is the one worth putting
+    on a screen:
+
+      gated  the address must be the one this browser registered with, so a
+             customer can identify themselves and nobody else
+      open   any address is accepted and looked up, which is what a first
+             implementation does and why support systems verify identity
+             instead of believing it
+
+    Neither hands the model an identifier. Both read it out of the conversation
+    in code. The difference is only whether it is checked against the person we
+    already had.
+    """
+    settings = conversation.contact_attributes or {}
+    registered = str(settings.get(EMAIL_ATTRIBUTE, "")) or conversation.contact_email
+
+    if str(settings.get(START_ATTRIBUTE, IDENTIFIED)) != ANONYMOUS:
+        return registered
+
+    said = stated_email(conversation)
+    if not said:
+        return None
+    if str(settings.get(LOOKUP_ATTRIBUTE, GATED)) == OPEN:
+        return said
+
+    known = (registered or "").lower()
+    return said if known and said.lower() == known else None
+
+
+def first_reply(conversation: Conversation) -> bool:
+    """True while we have not said anything in this conversation yet."""
+    return not any(
+        not message.incoming
+        and not message.private
+        and not message.activity
+        and not message.template
+        for message in conversation.messages
+    )
+
+
+# Put in front of the first thing we say to somebody we were told about before
+# they said a word. Written in code rather than asked for in the guidance,
+# because the guidance was ignored often enough to be useless: the model
+# answered the question and never mentioned how it knew whose account to open.
+#
+# The request behind it was to send a message as the customer, saying hello and
+# their address, so that nothing looked hidden. Chatwoot refuses that on a
+# widget inbox, and putting words in somebody's mouth is a strange way to be
+# transparent in any case. Saying what we know, before using it, answers the
+# same objection: "how did it know about me?"
+IDENTITY_NOTICE = (
+    "Before we start: you are signed in as {email}, so I can already see your "
+    "account without asking."
+)
+
+
+def announced(reply: str, conversation: Conversation) -> str:
+    """The reply, prefaced by what we knew before they told us.
+
+    Only on the first reply, and only where the conversation was identified from
+    the start. Somebody who typed their address a moment ago does not need to be
+    told that we read it.
+    """
+    settings = conversation.contact_attributes or {}
+    # Only where the page actually chose this. Absent means a conversation that
+    # never went through registration, and prefacing those would be announcing
+    # an arrangement nobody made.
+    if str(settings.get(START_ATTRIBUTE, "")) != IDENTIFIED:
+        return reply
+    known = identified_email(conversation)
+    if not known or not first_reply(conversation):
+        return reply
+    return f"{IDENTITY_NOTICE.format(email=known)}\n\n{reply}"
+
+
+AMOUNT_PATTERN = re.compile(r"\d+(?:[.,]\d{1,2})?")
+# A day, written how people write it: "23", "23rd", "the 23rd of July".
+DAY_PATTERN = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\b")
+MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+}
+NEWEST_WORDS = ("most recent", "latest", "newest", "last one", "recent one")
+OLDEST_WORDS = ("oldest", "earliest", "first one")
+
+
+def stated_choice(
+    conversation: Conversation, charges: Sequence[Charge]
+) -> Charge | None:
+    """Which payment the customer named, when they named exactly one.
+
+    Read out of their words in code, the same way the address is. The model is
+    never asked which charge to refund: it can say that a refund is wanted, and
+    the customer can say which payment, and neither of those is the same as
+    choosing whose money moves.
+
+    Only the newest thing they said counts, so changing their mind works.
+    """
+    if len(charges) < 2:
+        return charges[0] if charges else None
+
+    said = ""
+    for turn in reversed(conversation.turns()):
+        if turn.role == "user":
+            said = turn.content.lower()
+            break
+    if not said:
+        return None
+
+    if any(word in said for word in NEWEST_WORDS):
+        return charges[0]
+    if any(word in said for word in OLDEST_WORDS):
+        return charges[-1]
+
+    # An amount or a date, which are the two things the list shows and so the
+    # two ways anybody refers to one of them. Both are collected before deciding,
+    # because the answer has to name exactly one payment either way: a number
+    # that is an amount here and a day there has settled nothing.
+    wanted = set()
+    for found in AMOUNT_PATTERN.findall(said):
+        figure = found.replace(",", ".")
+        try:
+            wanted.add(int(round(float(figure) * 100)))
+        except ValueError:
+            continue
+        if "." not in figure:
+            # "20" means twenty of something, not twenty cents.
+            wanted.add(int(figure) * 100)
+
+    days = {int(day) for day in DAY_PATTERN.findall(said) if 1 <= int(day) <= 31}
+    months = {number for name, number in MONTHS.items() if name in said}
+    months |= {number for name, number in MONTHS.items() if name[:3] in said.split()}
+
+    matched = []
+    for charge in charges:
+        by_amount = charge.amount_cents in wanted
+        # A month on its own is not a choice, and a day with the wrong month
+        # beside it is somebody talking about something else.
+        by_date = charge.created.day in days and (
+            not months or charge.created.month in months
+        )
+        if by_amount or by_date:
+            matched.append(charge)
+
+    return matched[0] if len(matched) == 1 else None
+
+
+def why_not(charge: Charge, now: datetime | None = None) -> str:
+    """What stands in the way of refunding this one, in a customer's words.
+
+    Only the reasons that belong to the payment itself. How clearly they asked,
+    and whether there is more than one to choose between, are about the
+    conversation rather than about this charge.
+    """
+    now = now or datetime.now(timezone.utc)
+    if charge.disputed:
+        return "being disputed with your bank"
+    if charge.refunded:
+        return "already refunded"
+    if charge.amount_cents > MAX_AUTO_REFUND_CENTS:
+        return "over the amount I can refund on my own"
+    if (now - charge.created) > timedelta(days=MAX_CHARGE_AGE_DAYS):
+        return "outside the refund window"
+    return ""
+
+
+def describe_charges(charges: Sequence[Charge], now: datetime | None = None) -> str:
+    """The payments on the account, one per line, with what is wrong with each.
+
+    Written for somebody choosing between them, so a payment that cannot be
+    refunded is still listed and still says why. Leaving it out would answer
+    "what did I pay?" with a shorter list than the truth, and quietly drop the
+    one they were about to ask about.
+    """
+    if not charges:
         return "This account has no payments on record. There is nothing to show."
 
-    said = [
-        f"Most recent payment: {money(charge.amount_cents, charge.currency)} "
-        f"on {charge.created:%d %B %Y}."
-    ]
-    # Only worth saying when it is true. Told a payment "has not been refunded"
-    # the model repeats it, so somebody who asked what they had paid was
-    # answered with a refund status they never raised, which reads like the
-    # agent bracing for an argument. Whether a refund can happen is settled in
-    # code regardless, so nothing downstream needs this line.
-    if charge.refunded:
-        said.append("It has already been refunded.")
-    others = charge.sibling_unrefunded_count
-    if others:
-        said.append(
-            f"There is {others} other unrefunded payment on this account."
-            if others == 1
-            else f"There are {others} other unrefunded payments on this account."
+    lines = []
+    for charge in charges:
+        stops = why_not(charge, now)
+        lines.append(
+            f"- {money(charge.amount_cents, charge.currency)} on "
+            f"{charge.created:%d %B %Y}" + (f" ({stops})" if stops else "")
         )
-    return " ".join(said)
+    heading = (
+        "This account has one payment:"
+        if len(charges) == 1
+        else f"This account has {len(charges)} payments:"
+    )
+    return heading + "\n" + "\n".join(lines)
 
 
 def account_tools(state: State) -> dict[str, ToolFunction]:
@@ -669,10 +892,14 @@ def account_tools(state: State) -> dict[str, ToolFunction]:
     chat. If Chatwoot has no email for them there is nothing to look up, and
     offering the tool anyway would invite an answer built on a failed lookup.
     """
-    email = state.conversation.contact_email
+    email = identified_email(state.conversation)
     if not email:
         return {}
-    return {"get_last_purchase": lambda: describe_charge(state.payments.latest_charge(email))}
+    return {
+        "get_payments": lambda: describe_charges(
+            state.payments.charges_for(email), state.now
+        )
+    }
 
 
 def understand_node(state: State) -> State:
@@ -705,7 +932,9 @@ def understand_node(state: State) -> State:
 def answer_node(state: State) -> State:
     """Send the reply the model wrote, and close the turn."""
     assert state.proposal is not None
-    state.inbox.send_reply(state.conversation.id, state.proposal.reply)
+    state.inbox.send_reply(
+        state.conversation.id, announced(state.proposal.reply, state.conversation)
+    )
     # Resolved rather than left open: Chatwoot reopens a conversation as soon as
     # the customer writes again, so nothing is lost and the inbox does not fill
     # up with conversations we have already dealt with.
@@ -721,10 +950,32 @@ def refund_node(state: State) -> State:
     and lets the edge do the routing, so the approval is a line you can point at.
     """
     assert state.proposal is not None
+    known = identified_email(state.conversation)
+    state.charges = tuple(state.payments.charges_for(known)) if known else ()
+
+    # Anything already refunded cannot be chosen, but it is still listed, so a
+    # customer looking at their own history sees all of it.
+    refundable = [charge for charge in state.charges if not charge.refunded]
+    pool = refundable or list(state.charges)
+    chosen = stated_choice(state.conversation, pool)
+
+    if chosen is None and len(pool) > 1:
+        # Undecided rather than impossible. Reporting no charge here would say
+        # there are no payments when there are several, and hand to a colleague
+        # a question the customer can answer in a word.
+        state.charge = None
+        state.decision = Decision(
+            False,
+            f"customer has {len(pool)} payments and has not said which",
+            "ambiguous",
+        )
+        return state
+
+    # Their choice settles which one, so the policy no longer has to refuse for
+    # not being able to tell them apart. Everything else about the charge still
+    # applies, and is what decides whether the money moves.
     state.charge = (
-        state.payments.latest_charge(state.conversation.contact_email)
-        if state.conversation.contact_email
-        else None
+        replace(chosen, sibling_unrefunded_count=0) if chosen is not None else None
     )
     state.decision = refund_decision(
         state.charge, state.proposal.confidence, now=state.now
@@ -747,8 +998,11 @@ def execute_refund_node(state: State) -> State:
     # Written here rather than by the model, because it states an amount.
     state.inbox.send_reply(
         state.conversation.id,
-        f"That's refunded, {money(state.charge.amount_cents, state.charge.currency)} is on its way "
-        "back to your original payment method. It usually lands within a few days.",
+        announced(
+            f"That's refunded, {money(state.charge.amount_cents, state.charge.currency)} is on "
+            "its way back to your original payment method. It usually lands within a few days.",
+            state.conversation,
+        ),
     )
     # The same record a refusal leaves, for the case where money actually moved.
     state.inbox.add_private_note(
@@ -773,7 +1027,7 @@ def hold_node(state: State) -> State:
     # coming back when a human has not agreed to it.
     state.inbox.send_reply(
         state.conversation.id,
-        held_reply(state.proposal.reply, state.decision.code),
+        announced(held_reply(state.proposal.reply, state.decision.code), state.conversation),
     )
     # Deliberately left open, and not resolved: a person still has to act.
     state.inbox.add_private_note(
@@ -787,23 +1041,90 @@ def hold_node(state: State) -> State:
     return state
 
 
+def choice_label(charge: Charge, now: datetime | None = None) -> str:
+    """One payment as a button, and as something the matcher already reads.
+
+    Amount and date both, because that is what makes two payments tellable
+    apart, and because whichever of the two Chatwoot sends back when somebody
+    taps it lands in the conversation as ordinary words.
+    """
+    stops = why_not(charge, now)
+    return (
+        f"{money(charge.amount_cents, charge.currency)} on {charge.created:%d %B %Y}"
+        + (f" ({stops})" if stops else "")
+    )
+
+
+def choose_node(state: State) -> State:
+    """Show the payments and ask which one, instead of handing it to a person.
+
+    Being told "there is more than one payment, so a colleague will look" is a
+    dead end for something the customer can settle in a word. They are shown
+    what is on the account, including any payment that cannot be refunded and
+    why, and the next thing they say picks one.
+
+    Written here rather than by the model because it lists amounts and dates,
+    and left open because it is a question, not a hand-off.
+    """
+    options = [choice_label(charge, state.now) for charge in state.charges]
+    state.inbox.send_choice(
+        state.conversation.id,
+        announced(
+            "I can see more than one payment, so I would rather not guess.\n\n"
+            + describe_charges(state.charges, state.now)
+            + "\n\nWhich would you like refunded?",
+            state.conversation,
+        ),
+        options,
+    )
+    state.action = "asked which"
+    return state
+
+
 NODES: dict[str, Callable[[State], State]] = {
     "understand": understand_node,
     "answer": answer_node,
     "refund": refund_node,
     "execute_refund": execute_refund_node,
     "hold": hold_node,
+    "choose": choose_node,
 }
 
+def wants_refund(state: State) -> bool:
+    """A refund request we are in a position to act on.
+
+    A refund asked for by somebody we cannot identify is not one yet. Sending it
+    down the refund path anyway produced the worst possible answer: no charge
+    could be found, so the customer was told there were no payments on their
+    account, which was not true, and the request was passed to a colleague
+    before anyone had established who they were.
+
+    Asking who they are is the answer to that, and the model has already written
+    it, so this stays on the answering path until there is somebody to look up.
+    """
+    assert state.proposal is not None
+    return state.proposal.refund_requested and bool(
+        identified_email(state.conversation)
+    )
+
+
 EDGES: dict[str, Callable[[State], str | None]] = {
-    # What the model asked for.
-    "understand": lambda s: "refund" if s.proposal.refund_requested else "answer",
+    # What the model asked for, once there is somebody to ask about.
+    "understand": lambda s: "refund" if wants_refund(s) else "answer",
     # What the policy allows. This edge is the money gate, and nothing the model
     # returned is consulted here beyond the rubric score the policy scores itself.
-    "refund": lambda s: "execute_refund" if s.decision.auto_approve else "hold",
+    # More than one payment is a question for the customer, not a job for a
+    # colleague: they can answer it in a word, and being handed to a person for
+    # it is a dead end.
+    "refund": lambda s: (
+        "execute_refund"
+        if s.decision.auto_approve
+        else ("choose" if s.decision.code == "ambiguous" else "hold")
+    ),
     "answer": lambda s: None,
     "execute_refund": lambda s: None,
     "hold": lambda s: None,
+    "choose": lambda s: None,
 }
 
 
@@ -965,6 +1286,35 @@ class ChatwootInbox:
             template=item.get("message_type") == 3,
         )
 
+    @staticmethod
+    def _with_taps(entries: Sequence[dict]) -> list[Message]:
+        """The messages, with any tapped option turned into a customer turn.
+
+        Tapping one of the buttons on a question does not send a message.
+        Chatwoot records it as `submitted_values` on the question itself, which
+        is one of ours, so who spoke last never changes and the conversation
+        simply stops: the customer has answered and the agent is still waiting.
+
+        The answer is added as an incoming message so that everything after this
+        can treat tapping and typing as the same thing. It is given the negative
+        of the question's id, which is unique, stable across polls, and cannot
+        collide with a real one, so acting on it twice is prevented by exactly
+        the same means as any other message.
+        """
+        built: list[Message] = []
+        for item in entries:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            built.append(ChatwootInbox._message(item))
+            chosen = (item.get("content_attributes") or {}).get("submitted_values")
+            for pick in chosen or []:
+                said = (pick or {}).get("value") or (pick or {}).get("title") or ""
+                if said:
+                    built.append(
+                        Message(id=-int(item["id"]), content=said, incoming=True)
+                    )
+        return built
+
     def _conversation(self, entry: dict) -> Conversation:
         """One conversation, fetching its messages only when it has to.
 
@@ -988,11 +1338,7 @@ class ChatwootInbox:
         contact = (entry.get("meta") or {}).get("sender") or {}
         attributes = entry.get("custom_attributes") or {}
         handled = attributes.get(HANDLED_ATTRIBUTE)
-        newest = [
-            self._message(item)
-            for item in (entry.get("messages") or [])
-            if isinstance(item, dict) and "id" in item
-        ]
+        newest = self._with_taps(entry.get("messages") or [])
 
         usable = bool(newest) and not (newest[-1].activity or newest[-1].template)
         messages = tuple(newest) if usable else self._all_messages(conversation_id)
@@ -1000,8 +1346,11 @@ class ChatwootInbox:
         return Conversation(
             id=conversation_id,
             contact_email=contact.get("email"),
+            contact_attributes=contact.get("custom_attributes") or {},
             messages=messages,
-            handled_message_id=int(handled) if str(handled).isdigit() else None,
+            handled_message_id=(
+                int(handled) if str(handled).lstrip("-").isdigit() else None
+            ),
             # The fallback fetched everything, so in that case it is already whole.
             history_complete=not usable,
         )
@@ -1026,10 +1375,30 @@ class ChatwootInbox:
     def _all_messages(self, conversation_id: int) -> tuple[Message, ...]:
         response = self._client.get(f"/conversations/{conversation_id}/messages")
         response.raise_for_status()
-        return tuple(self._message(item) for item in response.json()["payload"])
+        return tuple(self._with_taps(response.json()["payload"]))
 
     def send_reply(self, conversation_id: int, content: str) -> None:
         self._post(conversation_id, content, private=False)
+
+    def send_choice(
+        self, conversation_id: int, content: str, options: Sequence[str]
+    ) -> None:
+        """A question with the answers as buttons, so nobody has to type one.
+
+        Each option carries its own label as its value, so whichever of the two
+        Chatwoot sends back when somebody taps it is a sentence the choice
+        matcher already reads. Tapping and typing then arrive as the same thing,
+        which also means a customer who ignores the buttons is no worse off.
+        """
+        self._post(
+            conversation_id,
+            content,
+            private=False,
+            content_type="input_select",
+            content_attributes={
+                "items": [{"title": option, "value": option} for option in options]
+            },
+        )
 
     def add_private_note(self, conversation_id: int, content: str) -> None:
         self._post(conversation_id, content, private=True)
@@ -1055,13 +1424,14 @@ class ChatwootInbox:
         )
         response.raise_for_status()
 
-    def _post(self, conversation_id: int, content: str, *, private: bool) -> None:
+    def _post(self, conversation_id: int, content: str, *, private: bool, **extra) -> None:
         response = self._client.post(
             f"/conversations/{conversation_id}/messages",
             json={
                 "content": content,
                 "message_type": "outgoing",
                 "private": private,
+                **extra,
             },
         )
         response.raise_for_status()
@@ -1210,45 +1580,61 @@ class StripePayments:
         somebody has already been partly refunded for."""
         return bool(entry.get("refunded")) or entry.get("amount_refunded", 0) > 0
 
-    def latest_charge(self, email: str) -> Charge | None:
+    def charges_for(self, email: str) -> list[Charge]:
+        """Every payment on the account, newest first.
+
+        The whole list was always fetched and all but one of it thrown away.
+        Keeping it is what lets somebody with two payments be shown both and
+        asked which they mean, rather than told we cannot tell them apart.
+
+        Each one carries the counts measured against the whole set, so the
+        policy can be applied to whichever is chosen without fetching again.
+        """
         customers = self._client.get("/customers", params={"email": email, "limit": 1})
         customers.raise_for_status()
         found = customers.json()["data"]
         if not found:
-            return None
+            return []
 
         charges = self._client.get(
             "/charges", params={"customer": found[0]["id"], "limit": 100}
         )
         charges.raise_for_status()
         entries = charges.json()["data"]
-        if not entries:
+
+        refunded_total = sum(1 for item in entries if self._has_any_refund(item))
+        untouched_total = sum(1 for item in entries if not self._has_any_refund(item))
+
+        built = []
+        for entry in entries:
+            refunded = self._has_any_refund(entry)
+            built.append(
+                Charge(
+                    id=entry["id"],
+                    amount_cents=entry["amount"],
+                    created=self._created(entry),
+                    refunded=refunded,
+                    # Other refunds on the account, not counting this one.
+                    prior_refund_count=refunded_total - (1 if refunded else 0),
+                    # Other payments that could equally be the one they mean.
+                    sibling_unrefunded_count=(
+                        untouched_total - (0 if refunded else 1)
+                    ),
+                    disputed=bool(entry.get("disputed")),
+                    currency=str(entry.get("currency") or "usd"),
+                )
+            )
+        return built
+
+    def latest_charge(self, email: str) -> Charge | None:
+        charges = self.charges_for(email)
+        if not charges:
             return None
-
-        prior_refund_count = sum(1 for item in entries if self._has_any_refund(item))
-        untouched = [item for item in entries if not self._has_any_refund(item)]
-
-        if untouched:
-            # Newest charge that could still be refunded, plus how many other
-            # candidates there are, so the policy can refuse to guess.
-            target = untouched[0]
-            siblings = len(untouched) - 1
-        else:
-            # Everything is already refunded. Return the newest anyway so the
-            # policy can say so rather than reporting no charge at all.
-            target = entries[0]
-            siblings = 0
-
-        return Charge(
-            id=target["id"],
-            amount_cents=target["amount"],
-            created=self._created(target),
-            refunded=self._has_any_refund(target),
-            prior_refund_count=prior_refund_count - (0 if untouched else 1),
-            sibling_unrefunded_count=siblings,
-            disputed=bool(target.get("disputed")),
-            currency=str(target.get("currency") or "usd"),
-        )
+        # The newest that could still be refunded. If they are all refunded,
+        # the newest of those, so the policy can say so rather than reporting
+        # no charge at all.
+        untouched = [charge for charge in charges if not charge.refunded]
+        return untouched[0] if untouched else charges[0]
 
     @staticmethod
     def _created(entry: dict) -> datetime:
@@ -1359,15 +1745,17 @@ Respond with a single JSON object and nothing else, of exactly this shape:
 # talk about it; whether a refund happens is still settled by refund_decision,
 # in code, after it has finished.
 TOOL_SPECS: dict[str, dict] = {
-    "get_last_purchase": {
+    "get_payments": {
         "type": "function",
         "function": {
-            "name": "get_last_purchase",
+            "name": "get_payments",
             "description": (
-                "Look up this customer's most recent payment: the amount, the "
-                "date, and whether any of it has already been refunded. Use it "
-                "whenever they ask about what they paid, when, or how much. "
-                "Takes no arguments: the customer is already identified."
+                "Look up this customer's payments: the amount and date of each, "
+                "and anything standing in the way of refunding it. Use it "
+                "whenever they ask about what they paid, when, or how much, and "
+                "before asking them for an order number or a date, which this "
+                "already tells you. Takes no arguments: the customer is already "
+                "identified."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },

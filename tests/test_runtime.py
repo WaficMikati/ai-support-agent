@@ -55,6 +55,11 @@ class RecordingInbox:
     def send_reply(self, conversation_id, content):
         self.replies.append(content)
 
+    def send_choice(self, conversation_id, content, options):
+        self.replies.append(content)
+        self.offered = list(options)
+
+
     def add_private_note(self, conversation_id, content):
         pass
 
