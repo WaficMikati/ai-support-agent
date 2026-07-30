@@ -16,6 +16,17 @@
                    cursor: pointer; color: #444; }
     button.reset:hover { background: #f4f4f5; }
     #reset-note { font-size: .85rem; color: #777; margin-top: .6rem; min-height: 1.2em; }
+    fieldset.scenario { margin-top: 2rem; border: 1px solid #e4e4e7; border-radius: .5rem;
+                        padding: 1rem 1.25rem 1.25rem; }
+    fieldset.scenario legend { font-size: .85rem; color: #777; padding: 0 .4rem; }
+    fieldset.scenario label { display: block; font-size: .85rem; color: #555;
+                              margin-bottom: .2rem; }
+    fieldset.scenario .field { margin-top: .6rem; }
+    fieldset.scenario .field[hidden] { display: none; }
+    fieldset.scenario select { width: 100%; padding: .4rem; font: inherit; font-size: .9rem;
+                               border: 1px solid #d4d4d8; border-radius: .4rem; background: #fff; }
+    .scenario-note { font-size: .8rem; color: #777; margin: .9rem 0 0; }
+    .scenario-note code { background: #f4f4f5; padding: .05rem .3rem; border-radius: .25rem; }
   </style>
 </head>
 <body>
@@ -27,6 +38,55 @@
   example <em>"can I skip a month?"</em>, <em>"do you have decaf?"</em> or
   <em>"my delivery hasn't arrived"</em>. Or ask for a refund: the visitor is a
   signed-in customer with a payment on file.</div>
+
+  <fieldset class="scenario">
+    <legend>Set up the customer</legend>
+    <div class="field">
+      <label for="history">Account history</label>
+      <select id="history">
+        <option value="clean">One payment, nothing refunded</option>
+        <option value="refunded">That payment is already refunded</option>
+        <option value="disputed">That payment is disputed with the bank</option>
+        <option value="prior">An earlier payment was refunded before</option>
+        <option value="multiple">Two payments, neither refunded</option>
+        <option value="none">No payments at all</option>
+      </select>
+    </div>
+
+    <div class="field" id="field-amount">
+      <label for="amount" id="label-amount">Payment amount</label>
+      <select id="amount">
+        <option value="2000">$20.00 — inside the auto-approval limit</option>
+        <option value="9000">$90.00 — over the limit, needs a person</option>
+      </select>
+    </div>
+
+    <div class="field" id="field-age">
+      <label for="age" id="label-age">Payment date</label>
+      <select id="age">
+        <option value="0">Today — inside the refund window</option>
+        <option value="45">45 days ago — outside the window</option>
+      </select>
+    </div>
+
+    <div class="field" id="field-amount2">
+      <label for="amount2">Second payment amount</label>
+      <select id="amount2">
+        <option value="9000">$90.00 — over the limit, needs a person</option>
+        <option value="2000">$20.00 — inside the auto-approval limit</option>
+      </select>
+    </div>
+
+    <div class="field" id="field-age2">
+      <label for="age2">Second payment date</label>
+      <select id="age2">
+        <option value="0">Today — inside the refund window</option>
+        <option value="45">45 days ago — outside the window</option>
+      </select>
+    </div>
+
+    <p class="scenario-note" id="expected"></p>
+  </fieldset>
 
   <button class="reset" id="reset">Start a fresh conversation</button>
   <p id="reset-note">A plain refresh resumes the same conversation, so use this
@@ -69,15 +129,105 @@
       } catch (e) { /* private mode; the reset still works for this session */ }
     }
 
+    // Put the selectors back where they were left. The reset reloads the page,
+    // and controls snapping back to their defaults while the note underneath
+    // describes something else is a confusing thing to have on a screen in
+    // front of a room.
+    (function () {
+      ["history", "amount", "age", "amount2", "age2"].forEach(function (id) {
+        var select = document.getElementById(id);
+        var saved = sessionStorage.getItem("demoChoice-" + id);
+        if (saved) select.value = saved;
+        select.addEventListener("change", function () {
+          sessionStorage.setItem("demoChoice-" + id, select.value);
+          refreshFields();
+        });
+      });
+    })();
+
+    // The amount and the date are hidden only when there is no payment to give
+    // them to. They stay for every other history, because they are not only
+    // refund inputs: the agent can look a payment up and talk about it, and
+    // "your payment of $90.00 on that date has already been refunded" is a real
+    // thing to demonstrate. Judging them by whether they change the refund
+    // outcome alone was too narrow.
+    //
+    // What they must not do is quietly contradict the label. refund_decision
+    // stops at the first check that fails, so a $90.00 payment with an earlier
+    // refund on the account trips the amount rule and never reaches the
+    // earlier-refund rule. Rather than forbid the combination, the line below
+    // works out which check really fires, in the same order the policy uses.
+    function firstFailure(history, amountCents, ageDays) {
+      if (history === "none") return "nothing on the account";
+      if (history === "disputed") return "disputed with the bank";
+      if (history === "refunded") return "already refunded";
+      if (history === "multiple") return "two payments to choose between";
+      if (amountCents > 5000) return "over the auto-approval limit";
+      if (ageDays > 30) return "outside the refund window";
+      if (history === "prior") return "an earlier refund on the account";
+      return null;
+    }
+
+    function refreshFields() {
+      var history = document.getElementById("history").value;
+      var amountCents = parseInt(document.getElementById("amount").value, 10);
+      var ageDays = parseInt(document.getElementById("age").value, 10);
+
+      var hasPayment = history !== "none";
+      // Two payments means two of everything. Giving them the same amount and
+      // the same date made "I cannot tell which one you mean" abstract: they
+      // were indistinguishable, so there was nothing for the customer to point
+      // at and nothing for the agent to be unable to choose between.
+      var twoPayments = history === "multiple";
+
+      document.getElementById("field-amount").hidden = !hasPayment;
+      document.getElementById("field-age").hidden = !hasPayment;
+      document.getElementById("field-amount2").hidden = !twoPayments;
+      document.getElementById("field-age2").hidden = !twoPayments;
+
+      document.getElementById("label-amount").textContent =
+        twoPayments ? "First payment amount" : "Payment amount";
+      document.getElementById("label-age").textContent =
+        twoPayments ? "First payment date" : "Payment date";
+
+      var failed = firstFailure(history, amountCents, ageDays);
+      document.getElementById("expected").textContent =
+        "Expect: " +
+        (failed
+          ? failed + ", so a colleague decides"
+          : "refunded automatically, with no person involved") +
+        ".";
+    }
+
+    refreshFields();
+
     (function () {
       var afterReset = sessionStorage.getItem("demoResetEmail");
       if (afterReset) {
         var cleared = sessionStorage.getItem("demoResetCleared") || "0";
+        var history = sessionStorage.getItem("demoResetHistory") || "clean";
+        var amount = sessionStorage.getItem("demoResetAmount") || "";
+        var days = parseInt(sessionStorage.getItem("demoResetAge") || "0", 10);
         sessionStorage.removeItem("demoResetEmail");
         sessionStorage.removeItem("demoResetCleared");
+        sessionStorage.removeItem("demoResetHistory");
+        sessionStorage.removeItem("demoResetAmount");
+        sessionStorage.removeItem("demoResetAge");
+        // Say what was actually set up, so what the agent does next can be
+        // checked against it rather than taken on trust.
+        var money = amount ? "$" + (parseInt(amount, 10) / 100).toFixed(2) : "a payment";
+        var when = days ? " from " + days + " days ago" : " from today";
+        var SETUP = {
+          clean: "one payment of " + money + when + ", nothing refunded",
+          refunded: "one payment of " + money + when + ", already refunded",
+          disputed: "one payment of " + money + when + ", disputed with the bank",
+          prior: "a payment of " + money + when + ", after an earlier one was refunded",
+          multiple: "two payments of " + money + when + ", neither refunded",
+          none: "no payments at all",
+        };
         document.getElementById("reset-note").textContent =
           "Fresh conversation as " + afterReset +
-          ", with a refundable payment. " +
+          ", with " + (SETUP[history] || SETUP.clean) + ". " +
           (cleared === "0"
             ? "The queue was already empty."
             : "Cleared " + cleared + " conversation(s) from the queue.") +
@@ -109,7 +259,29 @@
       button.disabled = true;
       note.textContent = "Starting a fresh conversation…";
 
-      fetch("/reset", { method: "POST" })
+      fetch("/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          // A hidden control sends its default, not whatever it was last set
+          // to. Otherwise a $90.00 chosen earlier is still in the box while
+          // the box is out of sight, and the account gets built to something
+          // other than what the page is showing.
+          amount_cents: document.getElementById("field-amount").hidden
+            ? 2000
+            : parseInt(document.getElementById("amount").value, 10),
+          backdate_days: document.getElementById("field-age").hidden
+            ? 0
+            : parseInt(document.getElementById("age").value, 10),
+          amount_cents_2: document.getElementById("field-amount2").hidden
+            ? 0
+            : parseInt(document.getElementById("amount2").value, 10),
+          backdate_days_2: document.getElementById("field-age2").hidden
+            ? 0
+            : parseInt(document.getElementById("age2").value, 10),
+          history: document.getElementById("history").value,
+        }),
+      })
         .then(function (response) { return response.json(); })
         .then(function (body) {
           if (!body.ok) throw new Error(body.error || "reset failed");
@@ -131,6 +303,9 @@
           // above claims the identity for that one instead.
           sessionStorage.setItem("demoResetEmail", body.email);
           sessionStorage.setItem("demoResetCleared", String(body.cleared || 0));
+          sessionStorage.setItem("demoResetHistory", body.history || "clean");
+          sessionStorage.setItem("demoResetAge", body.backdate_days || "0");
+          sessionStorage.setItem("demoResetAmount", body.amount_cents || "");
           note.textContent = "Fresh conversation ready, reloading…";
           location.reload();
         })

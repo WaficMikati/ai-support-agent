@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 import httpx
 
@@ -179,10 +179,42 @@ class Charge:
     created: datetime
     refunded: bool  # any refund at all, full or partial
     prior_refund_count: int
+    # The customer has already gone to their bank about this one. Refunding on
+    # top of a dispute is how you pay twice: the disputed amount is held by
+    # Stripe already, and the case is decided by the card network rather than by
+    # us. Always a person's call, whatever the amount.
+    disputed: bool = False
     # Other charges on the same customer that could equally be the one they
     # mean. Customers rarely say which payment they are talking about, so more
     # than one candidate is treated as a question for a human, not a guess.
     sibling_unrefunded_count: int = 0
+    # Stripe's three-letter code, lowercase. Carried so an amount can be written
+    # with its currency rather than as a bare number, which reads as dollars to
+    # anybody who was charged in euros.
+    currency: str = "usd"
+
+
+# Stripe holds most amounts in the smallest unit, so 2000 is $20.00. A few
+# currencies have no minor unit at all and 2000 means 2000, and dividing those
+# by a hundred understates a refund by two orders of magnitude.
+ZERO_DECIMAL = frozenset(
+    {"bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg",
+     "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf"}
+)
+CURRENCY_SYMBOLS = {"usd": "$", "eur": "€", "gbp": "£", "jpy": "¥"}
+
+
+def money(amount: int, currency: str = "usd") -> str:
+    """An amount as a person would read it.
+
+    Written out rather than left bare because "20.00" reads as dollars to
+    whoever is looking at it, which is only true by accident. Currencies without
+    a familiar symbol get their code after the number instead of a guessed one.
+    """
+    code = (currency or "usd").lower()
+    figure = f"{amount:,}" if code in ZERO_DECIMAL else f"{amount / 100:,.2f}"
+    symbol = CURRENCY_SYMBOLS.get(code)
+    return f"{symbol}{figure}" if symbol else f"{figure} {code.upper()}"
 
 
 @dataclass(frozen=True)
@@ -227,6 +259,11 @@ class Proposal:
 class Decision:
     auto_approve: bool
     reason: str
+    # The same thing as `reason`, in a form code can branch on. `reason` is
+    # written for the colleague who picks the ticket up and says exactly which
+    # threshold was missed; this says which case it was, so the customer can be
+    # told something true without publishing the policy back at them.
+    code: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -248,12 +285,19 @@ class Payments(Protocol):
     def refund(self, charge_id: str, idempotency_key: str) -> str: ...
 
 
+# What the model may call while it is working something out. No arguments by
+# design: the caller binds who the lookup is about, so the model chooses whether
+# to look, never whose record to look at.
+ToolFunction = Callable[[], str]
+
+
 class Understander(Protocol):
     def __call__(
         self,
         turns: Sequence[Turn],
         knowledge: str,
         articles: Sequence[Article],
+        tools: Mapping[str, ToolFunction] | None = None,
     ) -> Proposal: ...
 
 
@@ -279,16 +323,26 @@ def refund_decision(
     now = now or datetime.now(timezone.utc)
 
     if charge is None:
-        return Decision(False, "no charge found for this customer")
+        return Decision(False, "no charge found for this customer", "no_charge")
 
     if confidence < MIN_CONFIDENCE:
         return Decision(
             False,
             f"rubric score {confidence:.2f} below {MIN_CONFIDENCE}",
+            "unclear_request",
+        )
+
+    # Before the refunded check: a charge can be both, and this is the more
+    # serious of the two to report.
+    if charge.disputed:
+        return Decision(
+            False, f"charge {charge.id} is disputed with the card issuer", "disputed"
         )
 
     if charge.refunded:
-        return Decision(False, f"charge {charge.id} has already been refunded")
+        return Decision(
+            False, f"charge {charge.id} has already been refunded", "already_refunded"
+        )
 
     if charge.sibling_unrefunded_count > 0:
         total = charge.sibling_unrefunded_count + 1
@@ -296,27 +350,33 @@ def refund_decision(
             False,
             f"customer has {total} unrefunded charges, cannot tell which one "
             "they mean",
+            "ambiguous",
         )
 
     if charge.amount_cents > MAX_AUTO_REFUND_CENTS:
         return Decision(
             False,
-            f"amount {charge.amount_cents / 100:.2f} over the "
-            f"{MAX_AUTO_REFUND_CENTS / 100:.2f} auto-approval limit",
+            f"amount {money(charge.amount_cents, charge.currency)} over the "
+            f"{money(MAX_AUTO_REFUND_CENTS, charge.currency)} auto-approval limit",
+            "too_large",
         )
 
     age = now - charge.created
     if age > timedelta(days=MAX_CHARGE_AGE_DAYS):
         return Decision(
-            False, f"charge is {age.days} days old, limit is {MAX_CHARGE_AGE_DAYS}"
+            False,
+            f"charge is {age.days} days old, limit is {MAX_CHARGE_AGE_DAYS}",
+            "too_old",
         )
 
     if charge.prior_refund_count > 0:
         return Decision(
-            False, f"customer has {charge.prior_refund_count} previous refund(s)"
+            False,
+            f"customer has {charge.prior_refund_count} previous refund(s)",
+            "prior_refunds",
         )
 
-    return Decision(True, "within auto-approval policy")
+    return Decision(True, "within auto-approval policy", "approved")
 
 
 # --------------------------------------------------------------------------
@@ -377,6 +437,51 @@ HOLDING_REPLY = (
     "at your refund and come back to you shortly."
 )
 
+# Appended to whatever the model wrote, rather than replacing it, so a message
+# that asked two things still gets both answered. Written here and not by the
+# model because it is a commitment: somebody has to actually reply within a day
+# for it to be true, which is not the model's to promise.
+ESCALATION_NOTICE = (
+    "I have sent your refund request to my colleague for review. You should "
+    "receive an email within the next 24 hours."
+)
+
+# What the customer is told when a person has to decide, keyed by why.
+#
+# Said instead of the model's reply rather than after it. The model writes
+# before the policy runs, so it cannot know a colleague is about to take over,
+# and what it writes in the meantime is usually a question, asking which payment
+# they meant or for a date. By the time that arrives it is moot, and it argues
+# with the sentence underneath saying the request has already been passed on.
+# Code knows exactly which case it hit, and that makes a better sentence than a
+# question the model had to guess at.
+#
+# None of these quote a threshold. The colleague's note gives the number; the
+# customer gets the shape of the problem without the policy being published back
+# at them.
+HELD_EXPLANATIONS: dict[str, str] = {
+    "no_charge": "I'm sorry, I couldn't find any payments on this account.",
+    "already_refunded": "It looks like that payment has already been refunded.",
+    "disputed": (
+        "That payment is already being disputed with your bank, so a colleague "
+        "needs to handle it from here."
+    ),
+    "ambiguous": (
+        "There is more than one payment on your account, so I would rather not "
+        "guess which one you mean."
+    ),
+    "too_large": "A refund of that amount needs a colleague to approve it.",
+    "too_old": "That payment is older than I am able to refund automatically.",
+    "prior_refunds": (
+        "Because of earlier refunds on your account, this one needs a colleague "
+        "to look at it."
+    ),
+    # "unclear_request" is deliberately absent. There the doubt is about what
+    # the customer meant, not about the payment, so the model's own words are
+    # the better answer: somebody who said "maybe I could get a refund?" is
+    # better served by whatever it asked back than by a flat statement.
+}
+
 # Phrases that would tell a customer their money is on the way. Deliberately
 # blunt: this only has to catch a model that ignored the instruction not to
 # promise an outcome, and a false positive costs nothing but a plainer reply.
@@ -399,6 +504,62 @@ def safe_holding_reply(reply: str) -> str:
         log.warning("proposal promised a refund before approval, using safe wording")
         return HOLDING_REPLY
     return reply
+
+
+def approval_note(
+    charge: Charge,
+    proposal: Proposal,
+    refund_id: str,
+    now: datetime | None = None,
+) -> str:
+    """Why a refund was allowed through, written where the refusals are written.
+
+    A refusal already left a note giving the check that failed, so the case a
+    person was going to look at anyway is the one that explains itself. The
+    approvals, where money moved with nobody watching, left only a line on
+    stdout that scrolls away and dies with the process.
+
+    That is the wrong way round. The question asked afterwards about an agent
+    that acts on its own is not "why did you escalate", it is "why did you
+    act", and the answer should be sitting next to the conversation rather than
+    reconstructed from Stripe by hand.
+
+    Every threshold is quoted next to what it was measured against, so the note
+    stays true if the constants are changed later.
+    """
+    now = now or datetime.now(timezone.utc)
+    age_days = (now - charge.created).days
+    amount = money(charge.amount_cents, charge.currency)
+    return "\n".join(
+        [
+            f"Refund issued automatically: {amount}",
+            f"Charge {charge.id}, refund {refund_id}",
+            "",
+            "Every check passed:",
+            f"  amount {amount}, limit {money(MAX_AUTO_REFUND_CENTS, charge.currency)}",
+            f"  {age_days} days old, limit {MAX_CHARGE_AGE_DAYS}",
+            f"  earlier refunds on the account: {charge.prior_refund_count}",
+            "  not already refunded",
+            "  not disputed",
+            f"  other refundable charges: {charge.sibling_unrefunded_count}",
+            f"  rubric {proposal.confidence:.2f}, minimum {MIN_CONFIDENCE}"
+            f" ({proposal.signals})",
+        ]
+    )
+
+
+def held_reply(reply: str, code: str = "") -> str:
+    """What the customer is told when a person has to decide.
+
+    Always ends with the same commitment, because that part is owed whatever
+    went wrong. What comes before it depends on whether code knows something
+    concrete about the payment: if it does, it says that, and if the doubt is
+    only about what the customer meant, the model's own words are kept so
+    anything else they asked still gets answered.
+    """
+    explanation = HELD_EXPLANATIONS.get(code)
+    opening = explanation if explanation else safe_holding_reply(reply).rstrip()
+    return f"{opening}\n\n{ESCALATION_NOTICE}"
 
 
 def retrieval_query(turns: Sequence[Turn]) -> str:
@@ -466,6 +627,54 @@ class State:
 # --------------------------------------------------------------------------
 
 
+def describe_charge(charge: Charge | None) -> str:
+    """A payment as a sentence, for the model to read.
+
+    Deliberately no charge id: it is meaningless to the customer, and anything
+    put in front of the model can end up quoted back to them.
+    """
+    if charge is None:
+        # Phrased as a fact rather than as a failed search. "No payment was
+        # found" reads to the model like the lookup broke, and it then tells the
+        # customer it does not have the information, which is the opposite of
+        # what it just learned.
+        return "This account has no payments on record. There is nothing to show."
+
+    said = [
+        f"Most recent payment: {money(charge.amount_cents, charge.currency)} "
+        f"on {charge.created:%d %B %Y}."
+    ]
+    # Only worth saying when it is true. Told a payment "has not been refunded"
+    # the model repeats it, so somebody who asked what they had paid was
+    # answered with a refund status they never raised, which reads like the
+    # agent bracing for an argument. Whether a refund can happen is settled in
+    # code regardless, so nothing downstream needs this line.
+    if charge.refunded:
+        said.append("It has already been refunded.")
+    others = charge.sibling_unrefunded_count
+    if others:
+        said.append(
+            f"There is {others} other unrefunded payment on this account."
+            if others == 1
+            else f"There are {others} other unrefunded payments on this account."
+        )
+    return " ".join(said)
+
+
+def account_tools(state: State) -> dict[str, ToolFunction]:
+    """What the model may look up for this particular customer.
+
+    Every tool closes over the conversation's own contact, so the customer it
+    reads about is fixed here and cannot be steered by anything said in the
+    chat. If Chatwoot has no email for them there is nothing to look up, and
+    offering the tool anyway would invite an answer built on a failed lookup.
+    """
+    email = state.conversation.contact_email
+    if not email:
+        return {}
+    return {"get_last_purchase": lambda: describe_charge(state.payments.latest_charge(email))}
+
+
 def understand_node(state: State) -> State:
     """Read the conversation, fetch anything relevant, propose a reply."""
     turns = state.conversation.turns()
@@ -480,7 +689,9 @@ def understand_node(state: State) -> State:
             ", ".join(article.title for article in articles),
         )
 
-    state.proposal = state.understand(turns, state.knowledge, state.articles)
+    state.proposal = state.understand(
+        turns, state.knowledge, state.articles, account_tools(state)
+    )
     log.info(
         "conversation %s: refund_requested=%s (%.2f) over %s turns",
         state.conversation.id,
@@ -536,8 +747,13 @@ def execute_refund_node(state: State) -> State:
     # Written here rather than by the model, because it states an amount.
     state.inbox.send_reply(
         state.conversation.id,
-        f"That's refunded, {state.charge.amount_cents / 100:.2f} is on its way "
+        f"That's refunded, {money(state.charge.amount_cents, state.charge.currency)} is on its way "
         "back to your original payment method. It usually lands within a few days.",
+    )
+    # The same record a refusal leaves, for the case where money actually moved.
+    state.inbox.add_private_note(
+        state.conversation.id,
+        approval_note(state.charge, state.proposal, refund_id, now=state.now),
     )
     state.inbox.resolve(state.conversation.id)
     state.action = "refunded"
@@ -556,7 +772,8 @@ def hold_node(state: State) -> State:
     # safe wording replaces it: the customer must not be told their money is
     # coming back when a human has not agreed to it.
     state.inbox.send_reply(
-        state.conversation.id, safe_holding_reply(state.proposal.reply)
+        state.conversation.id,
+        held_reply(state.proposal.reply, state.decision.code),
     )
     # Deliberately left open, and not resolved: a person still has to act.
     state.inbox.add_private_note(
@@ -1025,11 +1242,35 @@ class StripePayments:
         return Charge(
             id=target["id"],
             amount_cents=target["amount"],
-            created=datetime.fromtimestamp(target["created"], tz=timezone.utc),
+            created=self._created(target),
             refunded=self._has_any_refund(target),
             prior_refund_count=prior_refund_count - (0 if untouched else 1),
             sibling_unrefunded_count=siblings,
+            disputed=bool(target.get("disputed")),
+            currency=str(target.get("currency") or "usd"),
         )
+
+    @staticmethod
+    def _created(entry: dict) -> datetime:
+        """When the payment was made, honouring a demo backdate if one is set.
+
+        Stripe stamps `created` itself and will not accept one, and a test clock
+        backdates the customer but not their charges, so there is no way to make
+        a genuinely old test payment. Without this the age check is the one rule
+        that cannot be demonstrated, only described.
+
+        Reading it from the charge's own metadata keeps the fiction in the data
+        rather than in the policy: `refund_decision` still just compares two
+        timestamps and has no idea a demo is happening. Safe by construction,
+        because the agent refuses to start against anything but a Stripe test
+        key, so this can never see a real payment.
+        """
+        made = datetime.fromtimestamp(entry["created"], tz=timezone.utc)
+        backdate = (entry.get("metadata") or {}).get("demo_backdate_days")
+        try:
+            return made - timedelta(days=float(backdate))
+        except (TypeError, ValueError):
+            return made
 
     def refund(self, charge_id: str, idempotency_key: str) -> str:
         response = self._client.post(
@@ -1100,6 +1341,48 @@ Respond with a single JSON object and nothing else, of exactly this shape:
 {"reply": "...", "refund_requested": true, "clear_request": true,
  "charge_identified": false, "hedging": false}"""
 
+# Read-only, and every one of them takes no arguments. That is the security
+# property, not a simplification: a tool that accepted an email address would
+# let the model pass along whatever the customer typed, and anyone could read a
+# stranger's payment history by naming their address. Who the customer is comes
+# from Chatwoot's contact record, which the widget set when they signed in, and
+# the model never gets to choose it.
+#
+# Nothing that moves money is here either. The model can look a payment up and
+# talk about it; whether a refund happens is still settled by refund_decision,
+# in code, after it has finished.
+TOOL_SPECS: dict[str, dict] = {
+    "get_last_purchase": {
+        "type": "function",
+        "function": {
+            "name": "get_last_purchase",
+            "description": (
+                "Look up this customer's most recent payment: the amount, the "
+                "date, and whether any of it has already been refunded. Use it "
+                "whenever they ask about what they paid, when, or how much. "
+                "Takes no arguments: the customer is already identified."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+}
+
+TOOL_GUIDANCE = """You can look things up before answering.
+
+Call a tool when the customer asks about their own account rather than about
+the product in general. Do not ask them for details a tool can give you, and
+do not ask them to confirm who they are: they are signed in.
+
+What a lookup returns is for you to read, not to recite. Answer the question they
+asked, in your own words, and leave out anything they did not ask about.
+
+If a lookup comes back empty, that is an answer, not a failure. Say there is
+nothing on the account. Do not say you cannot see it or do not have it, which is
+not true once you have looked, and do not then ask them for details you have
+just looked up yourself.
+
+When you have what you need, stop calling tools."""
+
 
 class Brain:
     """The model, over OpenRouter.
@@ -1160,18 +1443,25 @@ class Brain:
             transport=transport,
         )
 
+    # Three rounds is enough for "look it up, then answer" with room to spare,
+    # and it is a ceiling rather than a target: the loop stops as soon as the
+    # model answers instead of calling something. Without a bound, a model that
+    # keeps asking for the same tool never returns.
+    MAX_TOOL_ROUNDS = 3
+
     def understand(
         self,
         turns: Sequence[Turn],
         knowledge: str,
         articles: Sequence[Article] = (),
+        tools: Mapping[str, ToolFunction] | None = None,
     ) -> Proposal:
         """Read the conversation and propose the next reply.
 
-        One call, given the thread rather than a single message, returning both
-        the reply and whether a refund is being requested. It is a proposal: the
-        thresholds that decide whether money actually moves are applied
-        afterwards, in code, and are never shown to the model.
+        Given the thread rather than a single message, returning both the reply
+        and whether a refund is being requested. It is a proposal: the thresholds
+        that decide whether money actually moves are applied afterwards, in code,
+        and are never shown to the model.
 
         This replaced a classify-then-branch design, where each message was
         reduced to one of two labels before anything was understood. That shape
@@ -1179,34 +1469,65 @@ class Brain:
         pushed every distinction into the rubric: "how do I get a refund?" was
         read as a request and refunded twenty dollars until an example was added
         forbidding it. The list of such examples has no end.
+
+        Two phases when tools are offered, because Groq rejects `tools` and
+        `response_format` in one request outright:
+
+            json mode cannot be combined with tool/function calling
+
+        So the model is first allowed to look things up, and only then asked for
+        the proposal, with whatever it found already in the conversation. The
+        two-phase shape is kept even where a provider would allow one call: a
+        second path that only some providers exercise is a second path that
+        breaks unnoticed.
+
+        It is not free. Offering tools costs two calls per message even when
+        nothing is looked up, and three when something is, because the gathering
+        phase has to be told it is finished. Worth knowing against a rate limit:
+        a conversation is roughly twice the requests it used to be. When no tools
+        are offered it stays at one call.
         """
-        system = [
+        base = [
             "You are a customer support agent for a subscription business.",
             "",
             "How to behave:",
             knowledge,
         ]
         if articles:
-            system += [
+            base += [
                 "",
                 "Documentation you may state as fact. Anything specific about the "
                 "product, its prices or its policies must come from here. Do not "
                 "add details that are not written below.",
                 "",
             ]
-            system += [f"## {a.title}\n{a.content}" for a in articles]
+            base += [f"## {a.title}\n{a.content}" for a in articles]
         else:
-            system += [
+            base += [
                 "",
                 "No documentation matched this conversation, so state nothing "
                 "specific about the product, its prices or its policies. Answer "
                 "generally if the question does not need them, otherwise say a "
                 "colleague will follow up.",
             ]
-        system += ["", UNDERSTAND_RULES]
 
-        messages = [{"role": "system", "content": "\n".join(system)}]
-        messages += [{"role": t.role, "content": t.content} for t in turns]
+        conversation = [{"role": t.role, "content": t.content} for t in turns]
+        specs = [TOOL_SPECS[name] for name in (tools or {}) if name in TOOL_SPECS]
+        if specs:
+            # The gathering phase is deliberately not told to answer in JSON.
+            # Asked for a strict object and offered tools in the same breath, the
+            # model tends to produce the object immediately and never look
+            # anything up.
+            gathered = self._gather(
+                [{"role": "system", "content": "\n".join(base + ["", TOOL_GUIDANCE])}]
+                + conversation,
+                specs,
+                tools or {},
+            )
+            conversation = gathered[1:]
+
+        messages = [{"role": "system", "content": "\n".join(base + ["", UNDERSTAND_RULES])}]
+        messages += conversation
 
         last_payload = ""
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
@@ -1229,6 +1550,46 @@ class Brain:
             f"model did not return a usable proposal after {self.MAX_ATTEMPTS} "
             f"attempts. Last reply: {last_payload[:300]}"
         )
+
+    def _gather(
+        self,
+        messages: list[dict],
+        specs: list[dict],
+        tools: Mapping[str, ToolFunction],
+    ) -> list[dict]:
+        """Let the model look things up, and return the conversation it built.
+
+        Bounded, and it stops early the moment the model answers rather than
+        calling something, which is the usual case: most questions need no
+        lookup at all.
+        """
+        for round_number in range(1, self.MAX_TOOL_ROUNDS + 1):
+            message = self._chat_message(
+                messages, tools=specs, **self._provider_preferences()
+            )
+            calls = message.get("tool_calls") or []
+            if not calls:
+                return messages
+
+            messages = messages + [message]
+            for call in calls:
+                name = (call.get("function") or {}).get("name", "")
+                run = tools.get(name)
+                # Arguments are read for the log and then ignored. Every tool
+                # here takes none, so there is nothing the model could pass that
+                # would change who the lookup is about.
+                log.info("tool call %s (round %s)", name or "<unnamed>", round_number)
+                result = run() if run else f"There is no tool called {name!r}."
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id", ""),
+                        "content": str(result),
+                    }
+                )
+
+        log.warning("tool loop hit its %s round limit", self.MAX_TOOL_ROUNDS)
+        return messages
 
     @staticmethod
     def _parse(payload: str) -> Proposal | None:
@@ -1284,6 +1645,15 @@ class Brain:
     MAX_ATTEMPTS = 5
 
     def _chat(self, messages: list[dict], **extra) -> str:
+        return self._chat_message(messages, **extra).get("content") or ""
+
+    def _chat_message(self, messages: list[dict], **extra) -> dict:
+        """The whole assistant message, not just its text.
+
+        The tool loop needs `tool_calls`, which is a sibling of `content` rather
+        than part of it, and is the only thing returned when the model decides
+        to call something instead of answering.
+        """
         payload = {
             "model": self._model,
             "messages": messages,
@@ -1293,7 +1663,7 @@ class Brain:
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             response = self._client.post("/chat/completions", json=payload)
             if response.is_success:
-                return response.json()["choices"][0]["message"]["content"]
+                return response.json()["choices"][0]["message"]
 
             if response.status_code not in self.RETRY_ON or attempt == self.MAX_ATTEMPTS:
                 raise RuntimeError(

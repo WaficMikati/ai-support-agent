@@ -70,7 +70,27 @@ def clear_queue(config: dict[str, str]) -> int:
     return cleared
 
 
-def new_customer() -> dict[str, str]:
+# Each of these builds an account that fails a different check in
+# refund_decision, so the policy can be demonstrated rather than described.
+#
+# There is one condition that cannot be set up this way: MAX_CHARGE_AGE_DAYS.
+# Stripe stamps `created` itself and will not accept one, so a charge is always
+# from today and "too old" cannot be reached with a real test charge.
+HISTORIES = ("clean", "refunded", "disputed", "prior", "multiple", "none")
+
+# Stripe's own test token for a charge the cardholder immediately disputes.
+# A real card number cannot be posted here: /v1/tokens answers 402 unless the
+# card was tokenised in a browser.
+DISPUTE_SOURCE = "tok_createDispute"
+
+
+def new_customer(
+    amount_cents: int = 0,
+    history: str = "clean",
+    backdate_days: int = 0,
+    amount_cents_2: int = 0,
+    backdate_days_2: int = 0,
+) -> dict[str, str]:
     """Provision a brand new customer for a fresh conversation.
 
     Deliberately not by deleting anything. Two constraints force this shape:
@@ -81,12 +101,15 @@ def new_customer() -> dict[str, str]:
         something gone, and setUser against a stale token fails silently, so
         the next visitor ends up anonymous and refunds stop matching
 
-    So each reset mints a unique address, gives it a refundable charge in
-    Stripe, and the page identifies itself as that person.
+    So each reset mints a unique address, gives it whatever payment history was
+    asked for, and the page identifies itself as that person.
     """
     config = reset_demo.settings()
     stamp = str(int(time.time()))
     email = f"demo+{stamp}@example.com"
+    amount = amount_cents or reset_demo.DEMO_AMOUNT_CENTS
+    if history not in HISTORIES:
+        history = "clean"
 
     setup_key = config.get("STRIPE_SETUP_KEY", "")
     if setup_key.startswith("sk_test_"):
@@ -95,22 +118,74 @@ def new_customer() -> dict[str, str]:
             headers={"Authorization": f"Bearer {setup_key}"},
             timeout=30,
         )
+        source = DISPUTE_SOURCE if history == "disputed" else "tok_visa"
         customer = client.post(
-            "/customers", data={"email": email, "source": "tok_visa"}
+            "/customers", data={"email": email, "source": source}
         )
         customer.raise_for_status()
-        charge = client.post(
-            "/charges",
-            data={
-                "amount": reset_demo.DEMO_AMOUNT_CENTS,
-                "currency": "usd",
-                "customer": customer.json()["id"],
-                "description": "demo subscription payment",
-            },
-        )
-        charge.raise_for_status()
+        customer_id = customer.json()["id"]
 
-    return {"email": email, "identifier": f"demo-{stamp}", "name": "Demo Customer"}
+        def charge_for(cents: int, description: str, aged: int = -1) -> str:
+            days = backdate_days if aged < 0 else aged
+            data = {
+                "amount": cents,
+                "currency": "usd",
+                "customer": customer_id,
+                "description": description,
+            }
+            if days:
+                # Stripe stamps `created` itself and a test clock backdates the
+                # customer but not their charges, so the age is carried in
+                # metadata and applied when the charge is read back.
+                data["metadata[demo_backdate_days]"] = str(days)
+            made = client.post("/charges", data=data)
+            made.raise_for_status()
+            return made.json()["id"]
+
+        def refund(charge_id: str) -> None:
+            done = client.post("/refunds", data={"charge": charge_id})
+            done.raise_for_status()
+
+        if history == "none":
+            pass  # A customer with nothing on file.
+        elif history == "disputed":
+            # Paid on a card that disputes it. The charge comes back from the
+            # create call with disputed still false; it is true by the time
+            # anything reads it again, which is all the agent ever does.
+            charge_for(amount, "demo subscription payment")
+        elif history == "refunded":
+            refund(charge_for(amount, "demo subscription payment"))
+        elif history == "prior":
+            # An older payment already refunded, and a fresh one to ask about.
+            refund(charge_for(amount, "demo subscription payment (earlier)"))
+            charge_for(amount, "demo subscription payment")
+        elif history == "multiple":
+            # Two candidates, so the policy refuses to guess which is meant.
+            # They get their own amount and date: identical payments made the
+            # ambiguity abstract, since there was nothing to tell them apart.
+            #
+            # Created oldest first, because the backdating is metadata Stripe
+            # knows nothing about. Stripe orders charges by when they were
+            # really made, and the adapter takes the newest, so creating them
+            # out of order would hand the agent the one the page calls older.
+            second = amount_cents_2 or amount
+            pair = sorted(
+                [(backdate_days, amount), (backdate_days_2, second)],
+                key=lambda made: -made[0],
+            )
+            for index, (aged, cents) in enumerate(pair, start=1):
+                charge_for(cents, f"demo subscription payment ({index})", aged=aged)
+        else:
+            charge_for(amount, "demo subscription payment")
+
+    return {
+        "email": email,
+        "identifier": f"demo-{stamp}",
+        "name": "Demo Customer",
+        "history": history,
+        "amount_cents": str(amount),
+        "backdate_days": str(backdate_days),
+    }
 
 
 def page_settings() -> dict[str, str]:
@@ -166,8 +241,20 @@ class DemoHandler(SimpleHTTPRequestHandler):
             return
 
         try:
+            length = int(self.headers.get("Content-Length") or 0)
+            asked = json.loads(self.rfile.read(length) or "{}") if length else {}
             cleared = clear_queue(reset_demo.settings())
-            body = {"ok": True, "cleared": cleared, **new_customer()}
+            body = {
+                "ok": True,
+                "cleared": cleared,
+                **new_customer(
+                    amount_cents=int(asked.get("amount_cents") or 0),
+                    history=str(asked.get("history") or "clean"),
+                    backdate_days=int(asked.get("backdate_days") or 0),
+                    amount_cents_2=int(asked.get("amount_cents_2") or 0),
+                    backdate_days_2=int(asked.get("backdate_days_2") or 0),
+                ),
+            }
         except Exception as error:  # the page should show what went wrong
             body = {"ok": False, "error": f"{type(error).__name__}: {error}"}
 

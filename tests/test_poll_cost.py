@@ -208,7 +208,7 @@ def thread_fetches(seen: list[str]) -> int:
 
 
 def capturing_understander(seen_turns):
-    def understand(turns, knowledge, articles=()):
+    def understand(turns, knowledge, articles=(), tools=None):
         seen_turns.append(tuple(turns))
         return Proposal(
             reply="of course",

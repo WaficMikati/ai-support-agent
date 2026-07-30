@@ -1,6 +1,8 @@
 """Check the classifier against labelled messages.
 
-    uv run python scripts/classify_eval.py
+    uv run python scripts/classify_eval.py            # every case
+    uv run python scripts/classify_eval.py --quick    # the six that matter most
+    uv run python scripts/classify_eval.py --bare     # guidance only, as it used to
 
 The classifier decides whether code is allowed to move money, so its rubric
 needs a regression test. Unit tests cannot do this: the behaviour lives in a
@@ -10,6 +12,19 @@ The distinction that matters most here is between asking *for* a refund and
 asking *about* refunds. "How do I get a refund?" is a question, and answering it
 means quoting the refund article. An earlier rubric read it as a request and
 refunded twenty dollars for it.
+
+It sends what the agent sends, which it did not always do. Given only the
+guidance, with no help centre and no tools, it was testing an arrangement the
+agent is never in, and the difference is not cosmetic: that same "how do i get a
+refund?" reads as a request with nothing else in the prompt and as a question
+once the Refunds article is beside it. So it reported failures that could not be
+reproduced in the running agent, and could not have caught anything the articles
+or the lookup cause. --bare keeps the old behaviour for comparing the two.
+
+A full run is not free. Every case now costs two or three model calls carrying
+the guidance, the matching articles and the tool definitions, which is a real
+slice of a day's tokens on a free tier. --quick is for when the answer is wanted
+before a demo rather than after one.
 
 Failures are reported by direction, because they are not equally bad. Answering
 a refund request with a reply is an annoyance. Refunding somebody who only asked
@@ -25,7 +40,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from agent import MIN_CONFIDENCE, Brain, Turn, env_value, load_env_file  # noqa: E402
+from agent import (  # noqa: E402
+    MIN_CONFIDENCE,
+    Brain,
+    ChatwootHelpCentre,
+    Turn,
+    env_value,
+    load_env_file,
+)
 
 # (message, expected intent). Keep adding real phrasings as they turn up.
 CASES: list[tuple[str, str]] = [
@@ -60,9 +82,33 @@ CASES: list[tuple[str, str]] = [
 KNOWLEDGE = (ROOT / "knowledge.md").read_text()
 PAUSE_SECONDS = 8
 
+# The ones that have actually gone wrong, for a run before a demo. Three of each
+# direction, including the two phrasings that read as requests when they are not.
+QUICK = (
+    "I want my money back",
+    "i need a refund",
+    "please refund my last payment",
+    "how do i get a refund?",
+    "if my coffee arrives stale can I get my money back?",
+    "can I skip a month?",
+)
+
+# A payment the agent can look up, so the lookup answers the way it would in a
+# real conversation rather than reporting an empty account. Fixed rather than
+# fetched: this is testing the classifier, and a Stripe round trip per case
+# would make a slow script slower without changing what is being measured.
+DEMO_CHARGE = "Most recent payment: 20.00 on 30 July 2026."
+
 
 def main() -> int:
     load_env_file(ROOT / ".env")
+    bare = "--bare" in sys.argv
+    cases = (
+        [case for case in CASES if case[0] in QUICK]
+        if "--quick" in sys.argv
+        else CASES
+    )
+
     brain = Brain(
         env_value("MODEL_API_KEY", "OPENROUTER_API_KEY"),
         model=env_value("MODEL_NAME", "OPENROUTER_MODEL", default=Brain.DEFAULT_MODEL),
@@ -70,19 +116,43 @@ def main() -> int:
             "MODEL_BASE_URL", "OPENROUTER_BASE_URL", default=Brain.DEFAULT_BASE_URL
         ),
     )
-    print(f"model: {brain._model}\n")
+
+    # What the agent has beside it on every message. Without these the script
+    # measures something the agent never does.
+    portal = env_value("HELP_CENTRE_PORTAL")
+    help_centre = (
+        ChatwootHelpCentre(
+            base_url=env_value("CHATWOOT_URL"),
+            account_id=env_value("CHATWOOT_ACCOUNT_ID", default="1"),
+            token=env_value("CHATWOOT_TOKEN"),
+            portal_slug=portal,
+        )
+        if portal and not bare
+        else None
+    )
+    tools = {} if bare else {"get_last_purchase": lambda: DEMO_CHARGE}
+
+    print(f"model: {brain._model}")
+    print(
+        "sending: guidance"
+        + ("" if help_centre is None else " + matching articles")
+        + ("" if not tools else " + the lookup tool")
+        + f"  ({len(cases)} cases)\n"
+    )
 
     dangerous: list[str] = []
     annoying: list[str] = []
     low_confidence: list[str] = []
 
-    for index, (message, expected) in enumerate(CASES):
+    for index, (message, expected) in enumerate(cases):
         # Paced deliberately. Each call carries the guidance and any matching
         # documentation, so a free tier limited by tokens per minute rather than
         # requests runs out well before this list does.
         if index:
             time.sleep(PAUSE_SECONDS)
-        result = brain.understand((Turn(role="user", content=message),), KNOWLEDGE)
+        turns = (Turn(role="user", content=message),)
+        articles = help_centre.relevant(message) if help_centre else ()
+        result = brain.understand(turns, KNOWLEDGE, articles, tools)
         got = "refund" if result.refund_requested else "support"
         ok = got == expected
         if not ok and got == "refund":
@@ -97,7 +167,7 @@ def main() -> int:
         mark = "ok  " if ok else "FAIL"
         print(f"  {mark} {got:<8} @{result.confidence:.2f}  {message!r}")
 
-    total = len(CASES)
+    total = len(cases)
     wrong = len(dangerous) + len(annoying)
     print(f"\n{total - wrong}/{total} correct")
 
