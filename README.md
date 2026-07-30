@@ -372,9 +372,17 @@ agent talking to itself:
   between issuing a refund and telling the customer.
 
 The poll costs **one request**, not one per conversation: the list response
-already carries the newest message. That matters because refunds awaiting a human
-stay open by design, so without it the agent would get slower the further behind
-the humans were.
+already carries the newest message, which is all it takes to decide whose turn it
+is. That matters because refunds awaiting a human stay open by design, so without
+it the agent would get slower the further behind the humans were.
+
+Writing a reply is the other half, and the line between them is worth stating
+because blurring it caused a real bug. Deciding to reply needs one message;
+writing one needs the whole thread. So the thread is fetched **only** for the
+conversations actually being answered, which is a small fraction of an open
+queue. Answering from the newest message alone is how the agent once greeted a
+customer halfway through a conversation, having been handed a lone email address
+with nothing before it.
 
 ---
 

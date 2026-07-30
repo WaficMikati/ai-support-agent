@@ -19,7 +19,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
@@ -124,6 +124,10 @@ class Conversation:
     # what makes the memory survive a restart, and what stops a second copy of
     # the agent answering the same message.
     handled_message_id: int | None = None
+    # Whether `messages` is the whole thread or only the newest entry the poll
+    # happened to carry. Deciding whether to reply needs one message; writing
+    # the reply needs all of them, and the two are fetched at different moments.
+    history_complete: bool = False
 
     def turns(self, limit: int = 10) -> tuple[Turn, ...]:
         """The conversation as the model should read it, oldest last-limit first.
@@ -232,6 +236,7 @@ class Decision:
 
 class Inbox(Protocol):
     def open_conversations(self) -> list[Conversation]: ...
+    def with_history(self, conversation: Conversation) -> Conversation: ...
     def send_reply(self, conversation_id: int, content: str) -> None: ...
     def add_private_note(self, conversation_id: int, content: str) -> None: ...
     def resolve(self, conversation_id: int) -> None: ...
@@ -662,6 +667,10 @@ def run_once(
     for conversation in inbox.open_conversations():
         if not needs_reply(conversation):
             continue
+        # Only now is the rest of the thread worth fetching. Deciding to reply
+        # takes one message, writing the reply takes all of them, and this is
+        # the line between the two.
+        conversation = inbox.with_history(conversation)
         actions.append(
             handle_conversation(
                 conversation,
@@ -743,7 +752,7 @@ class ChatwootInbox:
         """One conversation, fetching its messages only when it has to.
 
         The list response already carries the newest message, and that is all
-        the loop needs: who spoke last. Fetching the full thread per
+        *this* step needs: whether it is our turn. Fetching the full thread per
         conversation made the poll cost one request per open conversation, so
         the agent got measurably slower as the queue of refunds awaiting a human
         grew, and those conversations stay open by design.
@@ -751,6 +760,12 @@ class ChatwootInbox:
         The fallback matters though. Chatwoot files its own entries as messages,
         and if the newest one is an activity or a template we cannot tell who
         spoke last without looking further back.
+
+        What comes back is therefore usually a conversation with one message in
+        it, which is why `history_complete` is on it. Anything that reads the
+        thread must call `with_history` first: replying from the newest message
+        alone is exactly the bug that made the agent greet a customer halfway
+        through a conversation.
         """
         conversation_id = entry["id"]
         contact = (entry.get("meta") or {}).get("sender") or {}
@@ -770,6 +785,25 @@ class ChatwootInbox:
             contact_email=contact.get("email"),
             messages=messages,
             handled_message_id=int(handled) if str(handled).isdigit() else None,
+            # The fallback fetched everything, so in that case it is already whole.
+            history_complete=not usable,
+        )
+
+    def with_history(self, conversation: Conversation) -> Conversation:
+        """The same conversation with the whole thread attached.
+
+        Called for the conversations about to be answered and no others, which
+        is what keeps a poll over a long queue at one request. Deciding whether
+        to reply needs the newest message; writing the reply needs everything
+        said so far, and only a small fraction of open conversations are being
+        replied to on any given pass.
+        """
+        if conversation.history_complete:
+            return conversation
+        return replace(
+            conversation,
+            messages=self._all_messages(conversation.id),
+            history_complete=True,
         )
 
     def _all_messages(self, conversation_id: int) -> tuple[Message, ...]:

@@ -48,6 +48,10 @@ class RecordingInbox:
             )
         ]
 
+    def with_history(self, conversation):
+        # This fake serves its whole thread inline.
+        return conversation
+
     def send_reply(self, conversation_id, content):
         self.replies.append(content)
 
@@ -56,9 +60,6 @@ class RecordingInbox:
 
     def resolve(self, conversation_id):
         self.resolved.append(conversation_id)
-
-    def record_handled(self, conversation_id, message_id):
-        pass
 
     def record_handled(self, conversation_id, message_id):
         self.recorded.append((conversation_id, message_id))

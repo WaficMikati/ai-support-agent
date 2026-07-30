@@ -39,6 +39,10 @@ class FakeInbox:
     def open_conversations(self):
         return self.conversations
 
+    def with_history(self, conversation):
+        # These fakes are built with their whole thread already in them.
+        return conversation
+
     def send_reply(self, conversation_id, content):
         self.replies.append((conversation_id, content))
 
